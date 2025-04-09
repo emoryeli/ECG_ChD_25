@@ -13,9 +13,11 @@ from helper_code import *
 
 # Select device (CPU or GPU)
 #device = torch.device("cpu")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-THRESHOLD_PROBABILITY = 0.5
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease
+source_string = '# Source:' # used to remove CODE 15% data from the traiing set
+CODE15 = 'CODE-15%' # used to remove CODE 15% data from the traiing set
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels):
@@ -34,9 +36,17 @@ def train_model(data_folder, model_folder, verbose):
     if verbose:
         print('Finding the training data...')
 
-    records = find_records(data_folder)
+    # Find the records and remove CODE 15% data from the training set
+    all_records = find_records(data_folder)
+    records = []
+    for record in all_records:
+        header = load_header(os.path.join(data_folder, record))
+        source, has_source = get_variable(header, source_string)
+        if not has_source or source != CODE15:
+            records.append(record)
+
     if len(records) == 0:
-        raise FileNotFoundError('No data were provided.')
+        raise FileNotFoundError('No useful data were provided after removing CODE 15 data.')
 
     if verbose:
         print('Extracting labels...')
@@ -70,7 +80,7 @@ def train_model(data_folder, model_folder, verbose):
 
         best_val_loss = float('inf')
 
-        for epoch in range(30):
+        for epoch in range(20):
             model.train()
             total_loss = 0
             for X, y in train_loader:
@@ -78,6 +88,7 @@ def train_model(data_folder, model_folder, verbose):
                 outputs = model(X.to(device))
                 loss = loss_fn(outputs, y.to(device))
                 loss.backward()
+                #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # gradient clipping (for long ECGs)
                 optimizer.step()
                 total_loss += loss.item() * X.size(0)
 
@@ -85,7 +96,7 @@ def train_model(data_folder, model_folder, verbose):
 
             model.eval()
             val_loss = 0
-            val_outputs = [] #predicted probabilities, float64
+            val_outputs = [] #predicted probabilities, float
             val_targets = [] #labels, 0 or 1
             
             with torch.no_grad():
@@ -97,34 +108,35 @@ def train_model(data_folder, model_folder, verbose):
                     val_outputs.extend(probs.tolist())
                     val_targets.extend(y.cpu().numpy().tolist())
             avg_val_loss = val_loss / len(val_loader.dataset)
-            f1 = compute_f_measure(val_targets, (np.array(val_outputs) >= THRESHOLD_PROBABILITY).astype(int))
+            f1 = compute_f_measure(val_targets, (np.array(val_outputs) > THRESHOLD_PROBABILITY).astype(int))
             challenge_score = compute_challenge_score(np.array(val_targets), np.array(val_outputs))
             scheduler.step(avg_val_loss)
 
             if verbose:
                 print(f"Fold {fold + 1}, Epoch {epoch + 1}: "
                     f"Train Loss = {avg_train_loss:.4f}, "
-                    f"Val Loss = {avg_val_loss:.4f}, "
+                    f"Validation Loss = {avg_val_loss:.4f}, "
                     f"F1 = {f1:.4f}, "
                     f"Challenge Score = {challenge_score:.4f}, "
                     f"LR = {optimizer.param_groups[0]['lr']:.2e}")
                 
                 # Check how many true positives are in top 5%
-                #val_targets = np.array(val_targets)
-                #val_outputs = np.array(val_outputs)
+                val_targets = np.array(val_targets)
+                val_outputs = np.array(val_outputs)
 
                 # sort by predicted probability
-                #top5_indices = np.argsort(val_outputs)[::-1][:int(0.05 * len(val_outputs))]
-                #top5_labels = val_targets[top5_indices]
+                top5_indices = np.argsort(val_outputs)[::-1][:int(0.05 * len(val_outputs))]
+                top5_labels = val_targets[top5_indices]
 
-                #print(f"Top 5% Chagas cases: {np.sum(top5_labels)} out of {np.sum(val_targets)} positives")
+                print(f"Chagas instances among Top 5% probabilities: {np.sum(top5_labels)} out of total {np.sum(val_targets)} positives")
                 #print(len(val_outputs))
                 #print(len(val_targets))
                 #print(f"top 5% indices: {top5_indices}")
                 #print(f"top 5% labels: {top5_labels}")
-                all_indices = np.argsort(val_outputs)[::-1][:int(len(val_outputs))]
+                #all_indices = np.argsort(val_outputs)[::-1][:int(len(val_outputs))]
                 #print("orded labels:", val_targets[all_indices])
                 #print("predicted probabilities:", np.sort(val_outputs)[::-1])
+                print('Fold', fold + 1, 'Epoch', epoch + 1, 'Ended')
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -161,7 +173,7 @@ def run_model(record, model, verbose):
 def extract_features(record):
     signal, _ = load_signals(record)
     signal = np.nan_to_num(signal).T
-    max_len = 5000 # ptb-xl data has 5000 samples
+    max_len = 5000 # ptb-xl data has 5000 samples per ECG lead
     if signal.shape[1] < max_len:
         pad_width = max_len - signal.shape[1]
         signal = np.pad(signal, ((0, 0), (0, pad_width)))
@@ -179,7 +191,7 @@ def init_weights(m):
         nn.init.constant_(m.bias, 0)
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=17, downsample=False):
+    def __init__(self, in_channels, out_channels, kernel_size=5, downsample=False):
         super().__init__()
         stride = 2 if downsample else 1
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=kernel_size//2)
