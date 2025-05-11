@@ -212,7 +212,6 @@ class DropPath(nn.Module):
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
 
-
 def drop_path(x, drop_prob=0.0, training=False):
     if drop_prob == 0. or not training:
         return x
@@ -296,7 +295,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         self.norm = nn.LayerNorm(dims[-1])
         self.pool = nn.AdaptiveAvgPool1d(1)
 
-        # Global lightweight Transformer
+        # Global Attention - a lightweight Transformer Encoder
         self.global_attention = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=dims[-1], nhead=4, dim_feedforward=dims[-1]*2, dropout=0.1,        
