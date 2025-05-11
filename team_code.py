@@ -85,7 +85,7 @@ def train_model(data_folder, model_folder, verbose):
 
         best_val_loss = float('inf')
 
-        for epoch in range(50):
+        for epoch in range(30):
             if verbose:
                 print(f"\nStarting Fold {fold}, Epoch {epoch + 1}: ")
             model.train()
@@ -283,7 +283,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         for i, num_blocks in enumerate(stages):
             stage = []
             for j in range(num_blocks):
-                stage.append(ConvNeXtV2Block1D(dims[i], drop_path=dp_rates[cur]))
+                stage.append(ConvNeXtV2Block1D(dims[i], drop_prob=dp_rates[cur]))
                 cur += 1
             self.blocks.append(nn.Sequential(*stage))
 
