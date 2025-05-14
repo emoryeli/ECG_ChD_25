@@ -5,7 +5,7 @@ RUN mkdir /challenge
 COPY ./ /challenge
 WORKDIR /challenge
 
-## Install your dependencies here using apt install, etc.
+## Install dependencies using apt install, etc.
 
-## Include the following line if you have a requirements.txt file.
+## install python tools
 RUN pip install -r requirements.txt
