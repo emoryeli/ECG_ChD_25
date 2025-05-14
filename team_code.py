@@ -14,6 +14,8 @@ from helper_code import *
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 if device.type == 'cuda':
     torch.backends.cudnn.benchmark = True
+elif device.type == 'mps':
+    torch.mps.empty_cache()  # helpful after large model or dataset loads
 
 THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to remove CODE 15% data from the traiing set
@@ -57,7 +59,7 @@ def train_model(data_folder, model_folder, verbose):
     data_paths = [os.path.join(data_folder, r) for r in records]
     labels = np.array(labels)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
     best_val_loss_overall = float('inf')
     best_model_state_overall = None
 
@@ -75,7 +77,8 @@ def train_model(data_folder, model_folder, verbose):
         train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-        model = ConvNeXtV2_1D_ECG().to(device)
+        model = ConvNeXtV2_1D_ECG().to(device).to(torch.float32) # use float32 for training
+        #model.apply(init_weights) # initialize weights
         optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
         #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)  # 20 epochs
@@ -85,7 +88,7 @@ def train_model(data_folder, model_folder, verbose):
 
         best_val_loss = float('inf')
 
-        for epoch in range(30):
+        for epoch in range(20):
             if verbose:
                 print(f"\nStarting Fold {fold}, Epoch {epoch + 1}: ")
             model.train()
@@ -103,7 +106,7 @@ def train_model(data_folder, model_folder, verbose):
 
             model.eval()
             val_loss = 0
-            val_outputs = [] #predicted probabilities, float64
+            val_outputs = [] #predicted probabilities, float32
             val_targets = [] #labels, 0 or 1
             
             with torch.no_grad():
@@ -111,9 +114,17 @@ def train_model(data_folder, model_folder, verbose):
                     outputs = model(X.to(device))
                     loss = loss_fn(outputs, y.to(device))
                     val_loss += loss.item() * X.size(0)
-                    probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas
+
+                    #probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas
+                    probs = torch.softmax(outputs, dim=1)[:, 1].to(dtype=torch.float32)
+                    if probs.device.type != 'cpu':
+                        probs = probs.cpu()
+                    probs = probs.numpy()
+
                     val_outputs.extend(probs.tolist())
-                    val_targets.extend(y.cpu().numpy().tolist())
+                    val_targets.extend(y.tolist())
+                    #val_targets.extend(y.cpu().numpy().tolist())
+
             avg_val_loss = val_loss / len(val_loader.dataset)
             scheduler.step(avg_val_loss) # scheduler.step() if using CosineAnnealingLR
             f1 = compute_f_measure(val_targets, (np.array(val_outputs) > THRESHOLD_PROBABILITY).astype(int))
@@ -212,6 +223,7 @@ class DropPath(nn.Module):
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
 
+
 def drop_path(x, drop_prob=0.0, training=False):
     if drop_prob == 0. or not training:
         return x
@@ -295,7 +307,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         self.norm = nn.LayerNorm(dims[-1])
         self.pool = nn.AdaptiveAvgPool1d(1)
 
-        # Global Attention - a lightweight Transformer Encoder
+        # Global lightweight Transformer
         self.global_attention = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=dims[-1], nhead=4, dim_feedforward=dims[-1]*2, dropout=0.1,        
