@@ -78,11 +78,10 @@ def train_model(data_folder, model_folder, verbose):
         val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
         model = ConvNeXtV2_1D_ECG().to(device).to(torch.float32) # use float32 for training
-        #model.apply(init_weights) # initialize weights
+        
         optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)  # 20 epochs
-        #loss_fn = nn.CrossEntropyLoss()
+
         weight = torch.tensor([1.0, 19.0])  # 5% positive -> 1:19 imbalance
         loss_fn = nn.CrossEntropyLoss(weight=weight.to(device))
 
@@ -115,7 +114,6 @@ def train_model(data_folder, model_folder, verbose):
                     loss = loss_fn(outputs, y.to(device))
                     val_loss += loss.item() * X.size(0)
 
-                    #probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas
                     probs = torch.softmax(outputs, dim=1)[:, 1].to(dtype=torch.float32)
                     if probs.device.type != 'cpu':
                         probs = probs.cpu()
@@ -204,16 +202,6 @@ def extract_features(record):
         signal = signal[:, :max_len]
     return torch.tensor(signal, dtype=torch.float32)
 
-# Initialize weights for ConvNeXtV2 using Kaiming Normal initialization
-""" def init_weights(m):
-    if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
-        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.BatchNorm1d):
-        nn.init.constant_(m.weight, 1)
-        nn.init.constant_(m.bias, 0) """
-
 # DropPath helper
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
@@ -222,7 +210,6 @@ class DropPath(nn.Module):
 
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
-
 
 def drop_path(x, drop_prob=0.0, training=False):
     if drop_prob == 0. or not training:
@@ -273,7 +260,7 @@ class ConvNeXtV2Block1D(nn.Module):
         x = shortcut + self.drop_path(x)
         return x
 
-# 1D ConvNeXtV2 Light model for 12-lead ECG
+# 1D ConvNeXtV2 + Transformer model for 12-lead ECG
 class ConvNeXtV2_1D_ECG(nn.Module):
     def __init__(self, input_channels=12, num_classes=2):
         super().__init__()
@@ -282,7 +269,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         drop_path_rate = 0.1
 
         self.stem = nn.Sequential(
-            nn.Conv1d(input_channels, dims[0], kernel_size=17, stride=2, padding=3), # try kernel_size= 7, 3, 5, 17, 21, 31, seems 17 is best
+            nn.Conv1d(input_channels, dims[0], kernel_size=17, stride=2, padding=3), # try kernel_size= 7, 3, 5, 17, 21, 31
             nn.BatchNorm1d(dims[0]),
             nn.GELU()
         )
@@ -307,7 +294,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         self.norm = nn.LayerNorm(dims[-1])
         self.pool = nn.AdaptiveAvgPool1d(1)
 
-        # Global lightweight Transformer
+        # Global Attention Transformer Layer
         self.global_attention = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=dims[-1], nhead=4, dim_feedforward=dims[-1]*2, dropout=0.1,        
