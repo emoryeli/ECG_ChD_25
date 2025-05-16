@@ -57,7 +57,8 @@ def train_model(data_folder, model_folder, verbose):
     data_paths = [os.path.join(data_folder, r) for r in records]
     labels = np.array(labels)
 
-    skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
     best_val_loss_overall = float('inf')
     best_model_state_overall = None
 
@@ -85,7 +86,7 @@ def train_model(data_folder, model_folder, verbose):
 
         best_val_loss = float('inf')
 
-        for epoch in range(20):
+        for epoch in range(30):
             if verbose:
                 print(f"\nStarting Fold {fold}, Epoch {epoch + 1}: ")
             model.train()
