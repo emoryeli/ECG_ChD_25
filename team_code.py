@@ -120,7 +120,6 @@ def train_model(data_folder, model_folder, verbose):
 
                     val_outputs.extend(probs.tolist())
                     val_targets.extend(y.tolist())
-                    #val_targets.extend(y.cpu().numpy().tolist())
 
             avg_val_loss = val_loss / len(val_loader.dataset)
             scheduler.step(avg_val_loss) # scheduler.step() if using CosineAnnealingLR
@@ -145,16 +144,6 @@ def train_model(data_folder, model_folder, verbose):
                 # sort by predicted probability and get top 5% indices and labels
                 top5_indices = np.argsort(val_outputs)[::-1][:int(0.05 * len(val_outputs))]
                 top5_labels = val_targets[top5_indices]
-
-                #print(f"Chagas instances among Top 5% probabilities: {np.sum(top5_labels)}. Total ground truth positives: {np.sum(val_targets)}.")
-                #print(len(val_outputs))
-                #print(len(val_targets))
-                #print(f"top 5% indices: {top5_indices}")
-                #print(f"top 5% labels: {top5_labels}")
-                #all_indices = np.argsort(val_outputs)[::-1][:int(len(val_outputs))]
-                #print("orded labels:", val_targets[all_indices])
-                #print("predicted probabilities:", np.sort(val_outputs)[::-1])
-                #print('Fold', fold, 'Epoch', epoch + 1, 'Ended')
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
