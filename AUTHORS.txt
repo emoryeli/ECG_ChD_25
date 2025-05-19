@@ -1,5 +1,4 @@
 # This file lists the authors of the project.
-# Names should be added in the format: Name or Organization <email address>
 
 Elaine Li <elaineli8011@gmail.com>
 Emory University, Atlanta, GA, 30322
