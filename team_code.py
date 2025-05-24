@@ -257,7 +257,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         drop_path_rate = 0.1
 
         self.stem = nn.Sequential(
-            nn.Conv1d(input_channels, dims[0], kernel_size=17, stride=2, padding=3), # try kernel_size= 7, 3, 5, 17, 21, 31
+            nn.Conv1d(input_channels, dims[0], kernel_size=21, stride=21, padding=3), # non-overlapping convolution: stride = kernel_size ('patchify' like ViT), 21 works best
             nn.BatchNorm1d(dims[0]),
             nn.GELU()
         )
