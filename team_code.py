@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
+from scipy.signal import resample  # for resampling ECG signals to 400Hz
 from helper_code import *
 
 # Select device (GPU or MPS or CPU)
@@ -14,8 +15,10 @@ if device.type == 'cuda':
     torch.backends.cudnn.benchmark = True
 elif device.type == 'mps':
     torch.mps.empty_cache()  # helpful after large model or dataset loads
+elif device.type == 'cpu':
+    torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease, may add threshold optimization later
 source_string = '# Source:' # used to remove CODE 15% data from the traiing set
 CODE15 = 'CODE-15%' # used to remove CODE 15% data from the traiing set
 
@@ -28,7 +31,7 @@ class ECGDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx):
-        signal = extract_features(self.records[idx])
+        signal = extract_ECG(self.records[idx])
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return signal, label
 
@@ -43,8 +46,8 @@ def train_model(data_folder, model_folder, verbose):
         header = load_header(os.path.join(data_folder, record))
         source, has_source = get_variable(header, source_string)
         Chagas_label, has_label = get_variable(header, label_string)
-        #if Chagas_label == 'True' or source != CODE15: # remove chagas negative data in CODE-15% dataset
-        if source != CODE15: # remove all CODE-15% data
+        #if Chagas_label == 'True' or source != CODE15: # remove chagas positive cases in CODE-15% dataset
+        if source != CODE15: # remove all CODE-15% data (this may pose some risk if the competition data set has also weakly labeled data)
             records.append(record)
 
     if len(records) == 0:
@@ -58,7 +61,7 @@ def train_model(data_folder, model_folder, verbose):
     labels = np.array(labels)
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    
+
     best_val_loss_overall = float('inf')
     best_model_state_overall = None
 
@@ -73,22 +76,23 @@ def train_model(data_folder, model_folder, verbose):
 
         train_dataset = ECGDataset(train_records, train_labels)
         val_dataset = ECGDataset(val_records, val_labels)
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
         model = ConvNeXtV2_1D_ECG().to(device).to(torch.float32) # use float32 for training
-        
-        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-
-        weight = torch.tensor([1.0, 19.0])  # 5% positive -> 1:19 imbalance
+        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)  # 20 epochs
+        #loss_fn = nn.CrossEntropyLoss()
+        weight = torch.tensor([1.0, 19.0])  # assuming 5% positive -> 1:19 imbalance; 2.2% positive -> 1:44 imbalance;
         loss_fn = nn.CrossEntropyLoss(weight=weight.to(device))
 
         best_val_loss = float('inf')
 
-        for epoch in range(30):
-            if verbose:
-                print(f"\nStarting Fold {fold}, Epoch {epoch + 1}: ")
+        for epoch in range(20):
+            # if verbose:
+            #     print(f"\nStarting Fold {fold}, Epoch {epoch + 1}:")
+
             model.train()
             total_loss = 0
             for X, y in train_loader:
@@ -104,8 +108,8 @@ def train_model(data_folder, model_folder, verbose):
 
             model.eval()
             val_loss = 0
-            val_outputs = [] #predicted probabilities, float32
-            val_targets = [] #labels, 0 or 1
+            val_outputs = [] # predicted probabilities, float32
+            val_targets = [] # labels, 0 or 1
             
             with torch.no_grad():
                 for X, y in val_loader:
@@ -113,6 +117,7 @@ def train_model(data_folder, model_folder, verbose):
                     loss = loss_fn(outputs, y.to(device))
                     val_loss += loss.item() * X.size(0)
 
+                    #probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas; .cpu().numpy() is slower
                     probs = torch.softmax(outputs, dim=1)[:, 1].to(dtype=torch.float32)
                     if probs.device.type != 'cpu':
                         probs = probs.cpu()
@@ -120,6 +125,7 @@ def train_model(data_folder, model_folder, verbose):
 
                     val_outputs.extend(probs.tolist())
                     val_targets.extend(y.tolist())
+                    #val_targets.extend(y.cpu().numpy().tolist()) # slower
 
             avg_val_loss = val_loss / len(val_loader.dataset)
             scheduler.step(avg_val_loss) # scheduler.step() if using CosineAnnealingLR
@@ -129,8 +135,8 @@ def train_model(data_folder, model_folder, verbose):
 
             if verbose:
                 print(f"Fold {fold}, Epoch {epoch + 1}: "
-                    f"Train Loss = {avg_train_loss:.3e}, "
-                    f"Validation Loss = {avg_val_loss:.3e}, "
+                    f"Train Loss = {avg_train_loss:.2e}, "
+                    f"Validation Loss = {avg_val_loss:.2e}, "
                     f"F1 = {f1:.4f}, "
                     f"AUROC = {auroc:.4f}, "
                     f"AUPRC = {auprc:.4f}, "
@@ -142,8 +148,18 @@ def train_model(data_folder, model_folder, verbose):
                 val_outputs = np.array(val_outputs)
 
                 # sort by predicted probability and get top 5% indices and labels
-                top5_indices = np.argsort(val_outputs)[::-1][:int(0.05 * len(val_outputs))]
-                top5_labels = val_targets[top5_indices]
+                #top5_indices = np.argsort(val_outputs)[::-1][:int(0.05 * len(val_outputs))]
+                #top5_labels = val_targets[top5_indices]
+
+                #print(f"Chagas instances among Top 5% probabilities: {np.sum(top5_labels)}. Total ground truth positives: {np.sum(val_targets)}.")
+                #print(len(val_outputs))
+                #print(len(val_targets))
+                #print(f"top 5% indices: {top5_indices}")
+                #print(f"top 5% labels: {top5_labels}")
+                #all_indices = np.argsort(val_outputs)[::-1][:int(len(val_outputs))]
+                #print("orded labels:", val_targets[all_indices])
+                #print("predicted probabilities:", np.sort(val_outputs)[::-1])
+                #print('Fold', fold, 'Epoch', epoch + 1, 'Ended')
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -172,17 +188,46 @@ def load_model(model_folder, verbose):
     return model
 
 def run_model(record, model, verbose):
-    x = extract_features(record).unsqueeze(0)
-    x = x.to(next(model.parameters()).device)
+    x = extract_ECG(record).unsqueeze(0)
+    x = x.to(next(model.parameters()).device) # moves x to the same device that the model's parameters are on
     output = model(x)
     probs = torch.softmax(output, dim=1).detach().cpu().numpy()[0]
     binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # 1 for Chagas disease, 0 for no Chagas diseas
     return binary_output, probs[1]
 
-def extract_features(record):
+""" def extract_ECG(record):
     signal, _ = load_signals(record)
     signal = np.nan_to_num(signal).T
     max_len = 5000 # ptb-xl data has 5000 samples per ECG lead
+    if signal.shape[1] < max_len:
+        pad_width = max_len - signal.shape[1]
+        signal = np.pad(signal, ((0, 0), (0, pad_width)))
+    else:
+        signal = signal[:, :max_len]
+    return torch.tensor(signal, dtype=torch.float32) """
+
+def extract_ECG(record):
+    # Load signal as (samples, leads), and header as text string
+    signal, _ = load_signals(record)
+    header = load_header(record)
+
+    # Get sampling frequency using your helper
+    fs = get_sampling_frequency(header)
+    if fs is None:
+        fs = 400  # Default/fallback, if not present in header
+
+    signal = np.nan_to_num(signal).T  # Now shape is (leads, samples)
+
+    # Resample to 400 Hz if needed
+    target_fs = 400
+    if fs != target_fs:
+        orig_len = signal.shape[1]
+        target_len = int(round(orig_len * target_fs / fs))
+        # Resample each lead separately
+        signal = np.array([resample(lead, target_len) for lead in signal])
+
+    # Truncate or pad to max_len = 5000 (12.5s at 400Hz)
+    max_len = 5000
     if signal.shape[1] < max_len:
         pad_width = max_len - signal.shape[1]
         signal = np.pad(signal, ((0, 0), (0, pad_width)))
@@ -206,7 +251,7 @@ def drop_path(x, drop_prob=0.0, training=False):
     shape = (x.shape[0],) + (1,) * (x.ndim - 1)
     random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
     random_tensor.floor_()
-    return x.div(keep_prob) * random_tensor
+    return x.div(keep_prob) * random_tensor # rescales the output to preserve the expected value
 
 # Global Response Normalization (GRN)
 class GRN(nn.Module):
@@ -220,13 +265,13 @@ class GRN(nn.Module):
         x = x / (g + self.eps)
         return self.gamma * x + self.beta
     
-# 1D ConvNeXtV2 basic block
+# 1D ConvNeXt V2 basic block
 class ConvNeXtV2Block1D(nn.Module):
     def __init__(self, dim, drop_prob=0.0, layer_scale_init_value=1e-6):
         super().__init__()
         self.dwconv = nn.Conv1d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv, no need to use large kernel_size
         self.norm = nn.LayerNorm(dim)
-        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.pwconv1 = nn.Linear(dim, 4 * dim) # inverted bottleneck: 1x1 conv
         self.grn = GRN(4 * dim)
         self.act = nn.GELU()
         self.pwconv2 = nn.Linear(4 * dim, dim)
@@ -248,16 +293,16 @@ class ConvNeXtV2Block1D(nn.Module):
         x = shortcut + self.drop_path(x)
         return x
 
-# 1D ConvNeXtV2 + Transformer model for 12-lead ECG
+# 1D ConvNeXtV2 + Transformer model: ~ 2.37 million parameters
 class ConvNeXtV2_1D_ECG(nn.Module):
     def __init__(self, input_channels=12, num_classes=2):
         super().__init__()
-        dims = [32, 64, 128, 256]  # Small dimensions
-        stages = [2, 2, 6, 2]       # Small block counts
+        dims = [32, 64, 128, 256]   # Small dimensions, try lareger dims like [64, 128, 256, 512] if data and compute allow
+        stages = [2, 2, 6, 2]       # Small block counts, try larger stages like [3, 3, 9, 3] if data and compute allow
         drop_path_rate = 0.1
 
         self.stem = nn.Sequential(
-            nn.Conv1d(input_channels, dims[0], kernel_size=21, stride=21, padding=3), # non-overlapping convolution: stride = kernel_size ('patchify' like ViT), 21 works best
+            nn.Conv1d(input_channels, dims[0], kernel_size=21, stride=21, padding=3), # non-overlapping convolution: stride = kernel_size ('patchify' like ViT), tried kernel_size = 7, 3, 5, 17, 21, 31, 61: 21 is the best
             nn.BatchNorm1d(dims[0]),
             nn.GELU()
         )
@@ -275,7 +320,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
 
             if i < len(stages) - 1:
                 self.blocks.append(nn.Sequential(
-                    nn.Conv1d(dims[i], dims[i+1], kernel_size=2, stride=2),
+                    nn.Conv1d(dims[i], dims[i+1], kernel_size=2, stride=2), # downsampling 
                     nn.BatchNorm1d(dims[i+1])
                 ))
 
@@ -286,7 +331,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         self.global_attention = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=dims[-1], nhead=4, dim_feedforward=dims[-1]*2, dropout=0.1,        
-                batch_first=True,            # operates on [Batch, Seq, Feature]
+                batch_first=True,            # operates on [Batch, Seq, Channel] format
             ),
             num_layers=1,
             enable_nested_tensor=True    # lets PyTorch pack padded inputs efficiently
@@ -312,10 +357,10 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         pooled = self.pool(x).squeeze(-1)
 
         # Global attention
-        global_feat = self.global_attention(x.transpose(1, 2))  # (B, L, C)
-        global_feat = global_feat.mean(dim=1)  # Mean pooling after attention
+        global_feature = self.global_attention(x.transpose(1, 2))  # (B, L, C)
+        global_feature = global_feature.mean(dim=1)  # Mean pooling after attention
 
-        x = pooled + global_feat  # Merge pooled and global features
+        x = pooled + global_feature  # Merge pooled and global features
 
         x = self.dropout(x)
         x = self.head(x)
