@@ -20,7 +20,7 @@ elif device.type == 'cpu':
 
 THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease, may add threshold optimization later
 source_string = '# Source:' # used to remove CODE 15% data from the traiing set
-CODE15 = 'CODE-15%' # used to remove CODE 15% data from the traiing set
+CODE15 = 'CODE-15%' # used to remove CODE 15% data from the training set
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels):
@@ -89,7 +89,7 @@ def train_model(data_folder, model_folder, verbose):
 
         best_val_loss = float('inf')
 
-        for epoch in range(20):
+        for epoch in range(30):
             # if verbose:
             #     print(f"\nStarting Fold {fold}, Epoch {epoch + 1}:")
 
