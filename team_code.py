@@ -211,10 +211,10 @@ def extract_ECG(record):
     signal, _ = load_signals(record)
     header = load_header(record)
 
-    # Get sampling frequency using your helper
+    # Get sampling frequency from header
     fs = get_sampling_frequency(header)
     if fs is None:
-        fs = 400  # Default/fallback, if not present in header
+        fs = 500  # Default, if not present in header (maybe problematic)
 
     signal = np.nan_to_num(signal).T  # Now shape is (leads, samples)
 
