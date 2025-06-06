@@ -226,8 +226,8 @@ def extract_ECG(record):
         # Resample each lead separately
         signal = np.array([resample(lead, target_len) for lead in signal])
 
-    # Truncate or pad to max_len = 5000 (12.5s at 400Hz)
-    max_len = 5000
+    # Truncate or pad to max_len = 2934 (7.2s at 400Hz)
+    max_len = 2934
     if signal.shape[1] < max_len:
         pad_width = max_len - signal.shape[1]
         signal = np.pad(signal, ((0, 0), (0, pad_width)))
