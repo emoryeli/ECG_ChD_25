@@ -36,9 +36,6 @@ class ECGDataset(Dataset):
         return signal, label
 
 def train_model(data_folder, model_folder, verbose):
-    if verbose:
-        print('Finding the training data...')
-
     # Find the records and remove CODE 15% data from the training set
     all_records = find_records(data_folder)
     records = []
@@ -82,8 +79,6 @@ def train_model(data_folder, model_folder, verbose):
         model = ConvNeXtV2_1D_ECG().to(device).to(torch.float32) # use float32 for training
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)  # 20 epochs
-        #loss_fn = nn.CrossEntropyLoss()
         weight = torch.tensor([1.0, 19.0])  # assuming 5% positive -> 1:19 imbalance; 2.2% positive -> 1:44 imbalance;
         loss_fn = nn.CrossEntropyLoss(weight=weight.to(device))
 
@@ -117,7 +112,6 @@ def train_model(data_folder, model_folder, verbose):
                     loss = loss_fn(outputs, y.to(device))
                     val_loss += loss.item() * X.size(0)
 
-                    #probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas; .cpu().numpy() is slower
                     probs = torch.softmax(outputs, dim=1)[:, 1].to(dtype=torch.float32)
                     if probs.device.type != 'cpu':
                         probs = probs.cpu()
@@ -146,20 +140,6 @@ def train_model(data_folder, model_folder, verbose):
                 # Check how many true positives are in top 5%
                 val_targets = np.array(val_targets)
                 val_outputs = np.array(val_outputs)
-
-                # sort by predicted probability and get top 5% indices and labels
-                #top5_indices = np.argsort(val_outputs)[::-1][:int(0.05 * len(val_outputs))]
-                #top5_labels = val_targets[top5_indices]
-
-                #print(f"Chagas instances among Top 5% probabilities: {np.sum(top5_labels)}. Total ground truth positives: {np.sum(val_targets)}.")
-                #print(len(val_outputs))
-                #print(len(val_targets))
-                #print(f"top 5% indices: {top5_indices}")
-                #print(f"top 5% labels: {top5_labels}")
-                #all_indices = np.argsort(val_outputs)[::-1][:int(len(val_outputs))]
-                #print("orded labels:", val_targets[all_indices])
-                #print("predicted probabilities:", np.sort(val_outputs)[::-1])
-                #print('Fold', fold, 'Epoch', epoch + 1, 'Ended')
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -194,17 +174,6 @@ def run_model(record, model, verbose):
     probs = torch.softmax(output, dim=1).detach().cpu().numpy()[0]
     binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # 1 for Chagas disease, 0 for no Chagas diseas
     return binary_output, probs[1]
-
-""" def extract_ECG(record):
-    signal, _ = load_signals(record)
-    signal = np.nan_to_num(signal).T
-    max_len = 5000 # ptb-xl data has 5000 samples per ECG lead
-    if signal.shape[1] < max_len:
-        pad_width = max_len - signal.shape[1]
-        signal = np.pad(signal, ((0, 0), (0, pad_width)))
-    else:
-        signal = signal[:, :max_len]
-    return torch.tensor(signal, dtype=torch.float32) """
 
 def extract_ECG(record):
     # Load signal as (samples, leads), and header as text string
