@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
-from scipy.signal import resample  # for resampling ECG signals to 400Hz
+from scipy.signal import resample_poly  # for resampling ECG signals to 400Hz
 from helper_code import *
 
 # Select device (GPU or MPS or CPU)
@@ -21,6 +21,7 @@ elif device.type == 'cpu':
 THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease, may add threshold optimization later
 source_string = '# Source:' # used to remove CODE 15% data from the traiing set
 CODE15 = 'CODE-15%' # used to remove CODE 15% data from the training set
+max_len = 4096  # Maximum length of the ECG signal after resampling and padding/truncating, 2934 or 4096 or 5000, some SaMi and CODE-15% data have 2934 samples 
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels):
@@ -177,30 +178,34 @@ def extract_ECG(record):
     signal, _ = load_signals(record)
     header = load_header(record)
 
-    # Get sampling frequency from header
+    # Get sampling frequency
     fs = get_sampling_frequency(header)
     if fs is None:
-        fs = 500  # Default, if not present in header (maybe problematic)
+        fs = 500  # Default, if not present in header
 
     signal = np.nan_to_num(signal).T  # Now shape is (leads, samples)
 
-    # Resample to 400 Hz if needed
+    # Resample to 400 Hz using polyphase filtering
     target_fs = 400
     if fs != target_fs:
-        orig_len = signal.shape[1]
-        target_len = int(round(orig_len * target_fs / fs))
-        # Resample each lead separately
-        signal = np.array([resample(lead, target_len) for lead in signal])
+        # Compute upsample and downsample factors
+        from math import gcd
+        g = gcd(int(target_fs), int(fs))
+        up = target_fs // g
+        down = fs // g
 
-    # Truncate or pad to max_len = 2934 (7.2s at 400Hz)
-    max_len = 2934
+        # Resample each lead separately using resample_poly
+        signal = np.array([resample_poly(lead, up, down) for lead in signal])
+
+    # Truncate or pad to fixed length (e.g. max_len = 2934 samples for 7.2s at 400 Hz)
+    # max_len = 2934 or 4096 or 5000, some SaMi and CODE-15% data have 2934 samples
     if signal.shape[1] < max_len:
         pad_width = max_len - signal.shape[1]
         signal = np.pad(signal, ((0, 0), (0, pad_width)))
     else:
         signal = signal[:, :max_len]
-    return torch.tensor(signal, dtype=torch.float32)
 
+    return torch.tensor(signal, dtype=torch.float32)
 # DropPath helper
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
@@ -268,7 +273,8 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         drop_path_rate = 0.1
 
         self.stem = nn.Sequential(
-            nn.Conv1d(input_channels, dims[0], kernel_size=21, stride=21, padding=3), # non-overlapping convolution: stride = kernel_size ('patchify' like ViT), tried kernel_size = 7, 3, 5, 17, 21, 31, 61: 21 is the best
+            # non-overlapping convolution: stride = kernel_size ('patchify' like ViT), tried kernel_size = 7, 3, 5, 17, 21, 31, 61: 21 is the best
+            nn.Conv1d(input_channels, dims[0], kernel_size=21, stride=21, padding=10), 
             nn.BatchNorm1d(dims[0]),
             nn.GELU()
         )
