@@ -206,6 +206,7 @@ def extract_ECG(record):
         signal = signal[:, :max_len]
 
     return torch.tensor(signal, dtype=torch.float32)
+    
 # DropPath helper
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
@@ -273,7 +274,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         drop_path_rate = 0.1
 
         self.stem = nn.Sequential(
-            # non-overlapping convolution: stride = kernel_size ('patchify' like ViT), tried kernel_size = 7, 3, 5, 17, 21, 31, 61: 21 is the best
+            # non-overlapping convolution: stride = kernel_size ('patchify' or tokenize like ViT), tried kernel_size = 7, 3, 5, 17, 21, 31, 61: 21 is the best
             nn.Conv1d(input_channels, dims[0], kernel_size=21, stride=21, padding=10), 
             nn.BatchNorm1d(dims[0]),
             nn.GELU()
