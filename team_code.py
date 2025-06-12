@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
-from scipy.signal import resample  # for resampling ECG signals to 400Hz
+from scipy.signal import resample_poly  # for resampling ECG signals to 400Hz
 from helper_code import *
 
 # Select device (GPU or MPS or CPU)
@@ -208,21 +208,26 @@ def extract_ECG(record):
 
     signal = np.nan_to_num(signal).T  # Now shape is (leads, samples)
 
-    # Resample to 400 Hz if needed
+    # Resample to 400 Hz using polyphase filtering
     target_fs = 400
     if fs != target_fs:
-        orig_len = signal.shape[1]
-        target_len = int(round(orig_len * target_fs / fs))
-        # Resample each lead separately
-        signal = np.array([resample(lead, target_len) for lead in signal])
+        # Compute upsample and downsample factors
+        from math import gcd
+        g = gcd(int(target_fs), int(fs))
+        up = target_fs // g
+        down = fs // g
 
-    # Truncate or pad to max_len = 2934 (7.2s at 400Hz)
-    # max_len = 2934 # 2934 or 4096 or 5000
+        # Resample each lead separately using resample_poly
+        signal = np.array([resample_poly(lead, up, down) for lead in signal])
+
+    # Truncate or pad to fixed length (e.g. max_len = 2934 samples for 7.2s at 400 Hz)
+    # max_len = 2934 or 4096 or 5000, some SaMi and CODE-15% data have 2934 samples
     if signal.shape[1] < max_len:
         pad_width = max_len - signal.shape[1]
         signal = np.pad(signal, ((0, 0), (0, pad_width)))
     else:
         signal = signal[:, :max_len]
+
     return torch.tensor(signal, dtype=torch.float32)
 
 #---------
@@ -305,7 +310,7 @@ class ResBlock1d(nn.Module):
         return x, y
 
 class ResNet1D_Chagas(nn.Module): # 9,626,386 trainable parameters
-    """Residual network for 1-dimensional ECG signals.
+    """Residual network for 1d ECG signals.
 
     def __init__(self, input_dim = (12, max_len), blocks_dim = list(zip([64, 128, 256, 512],[max_len, max_len//2, max_len//4, max_len//8])), n_classes=2, kernel_size=17, dropout_rate=0.5):
         super(ResNet1D_Chagas, self).__init__()
