@@ -230,9 +230,8 @@ def extract_ECG(record):
 
     return torch.tensor(signal, dtype=torch.float32)
 
-#---------
-# Adopted code from github repo: https://github.com/antonior92/ecg-chagas/
-# Original author: Antonio R. de la Torre, 2020
+# ---------
+# Adapted code from github repo: https://github.com/antonior92/ecg-chagas/
 
 def _padding(downsample, kernel_size):
     "Compute required padding"
@@ -310,7 +309,7 @@ class ResBlock1d(nn.Module):
         return x, y
 
 class ResNet1D_Chagas(nn.Module): # 9,626,386 trainable parameters
-    """Residual network for 1d ECG signals.
+    # Residual network for 1d ECG signals.
 
     def __init__(self, input_dim = (12, max_len), blocks_dim = list(zip([64, 128, 256, 512],[max_len, max_len//2, max_len//4, max_len//8])), n_classes=2, kernel_size=17, dropout_rate=0.5):
         super(ResNet1D_Chagas, self).__init__()
