@@ -18,10 +18,10 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease, add threshold optimization later
+THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease, may add threshold optimization later
 source_string = '# Source:' # used to remove CODE 15% data from the traiing set
 CODE15 = 'CODE-15%' # used to remove CODE 15% data from the traiing set
-max_len = 4096 # (10.2s at 400Hz) must be power of 2 because of the 1d ResNet model from "Screening for Chagas" paper, 2023
+max_len = 4096  # Maximum length of the ECG signal after resampling and padding/truncating, 2934 or 4096 or 5000, some SaMi and CODE-15% data have 2934 samples 
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels):
@@ -47,7 +47,7 @@ def train_model(data_folder, model_folder, verbose):
         header = load_header(os.path.join(data_folder, record))
         source, has_source = get_variable(header, source_string)
         Chagas_label, has_label = get_variable(header, label_string)
-        #if Chagas_label == 'True' or source != CODE15: # remove chagas positive cases in CODE-15% dataset
+        # if Chagas_label == 'True' or source != CODE15: # remove chagas positive cases in CODE-15% dataset
         if source != CODE15: # remove all CODE-15% data (this may pose some risk if the competition data set has also weakly labeled data)
             records.append(record)
 
@@ -61,7 +61,10 @@ def train_model(data_folder, model_folder, verbose):
     data_paths = [os.path.join(data_folder, r) for r in records]
     labels = np.array(labels)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # randomize labels to check for hidden leakage
+    # np.random.shuffle(labels)
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=123)
 
     best_val_loss_overall = float('inf')
     best_model_state_overall = None
@@ -80,13 +83,13 @@ def train_model(data_folder, model_folder, verbose):
         train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
         val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
-        model = ResNet1D_Chagas().to(device).to(torch.float32) # use float32 for training
+        model = ConvNeXtV2_1D_ECG().to(device).to(torch.float32) # use float32 for training
         optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
         #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)  # 20 epochs
         #loss_fn = nn.CrossEntropyLoss()
-        weight = torch.tensor([1.0, 19.0])  # assuming 5% positive -> 1:19 imbalance
-        loss_fn = nn.CrossEntropyLoss(weight=weight.to(device)) # , label_smoothing=0.1 for weakly labeled data
+        weight = torch.tensor([1.0, 19.0])  # assuming 5% positive -> 1:19 imbalance; 2.2% positive -> 1:44 imbalance;
+        loss_fn = nn.CrossEntropyLoss(weight=weight.to(device))
 
         best_val_loss = float('inf')
 
@@ -181,7 +184,7 @@ def save_model(model_folder, model):
     torch.save({'model_state_dict': model.state_dict()}, os.path.join(model_folder, 'model.pt'))
 
 def load_model(model_folder, verbose):
-    model = ResNet1D_Chagas()
+    model = model = ConvNeXtV2_1D_ECG()
     checkpoint = torch.load(os.path.join(model_folder, 'model.pt'), map_location=torch.device('cpu'))
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model = model.to(device)
@@ -189,7 +192,7 @@ def load_model(model_folder, verbose):
     return model
 
 def run_model(record, model, verbose):
-    x = extract_ECG(record).unsqueeze(0) # (1, 12, max_len)
+    x = extract_ECG(record).unsqueeze(0)
     x = x.to(next(model.parameters()).device) # moves x to the same device that the model's parameters are on
     output = model(x)
     probs = torch.softmax(output, dim=1).detach().cpu().numpy()[0]
@@ -208,7 +211,7 @@ def extract_ECG(record):
 
     signal = np.nan_to_num(signal).T  # Now shape is (leads, samples)
 
-    # Resample to 400 Hz using polyphase filtering
+    # Resample to 400 Hz using polyphase filtering resample_poly() 
     target_fs = 400
     if fs != target_fs:
         # Compute upsample and downsample factors
@@ -230,155 +233,134 @@ def extract_ECG(record):
 
     return torch.tensor(signal, dtype=torch.float32)
 
-#---------
-# Adopted code from github repo: https://github.com/antonior92/ecg-chagas/
-# Original author: Antonio R. de la Torre, 2023
-
-def _padding(downsample, kernel_size):
-    "Compute required padding"
-    padding = max(0, int(np.floor((kernel_size - downsample + 1) / 2)))
-    return padding
-
-def _downsample(n_samples_in, n_samples_out):
-    "Compute downsample rate"
-    downsample = int(n_samples_in // n_samples_out)
-    if downsample < 1:
-        raise ValueError("Number of samples should always decrease")
-    if n_samples_in % n_samples_out != 0:
-        raise ValueError("Number of samples for two consecutive blocks "
-                         "should always decrease by an integer factor.")
-    return downsample
-
-class ResBlock1d(nn.Module):
-    def __init__(self, n_filters_in, n_filters_out, downsample, kernel_size, dropout_rate):
-        if kernel_size % 2 == 0:
-            raise ValueError("The current implementation only support odd values for `kernel_size`.")
-        super(ResBlock1d, self).__init__()
-
-        # Forward path
-        padding1 = _padding(1, kernel_size)
-        self.conv1 = nn.Conv1d(n_filters_in, n_filters_out, kernel_size, padding=padding1, bias=False)
-        self.bn1 = nn.BatchNorm1d(n_filters_out)
-        self.relu = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout_rate)
-
-        padding2 = _padding(downsample, kernel_size)
-        self.conv2 = nn.Conv1d(n_filters_out, n_filters_out, kernel_size,
-                               stride=downsample, padding=padding2, bias=False)
-        self.bn2 = nn.BatchNorm1d(n_filters_out)
-        self.dropout2 = nn.Dropout(dropout_rate)
-
-        # Skip connection
-        skip_connection_layers = []
-
-        # Deal with downsampling
-        if downsample > 1:
-            maxpool = nn.MaxPool1d(downsample, stride=downsample)
-            skip_connection_layers += [maxpool]
-
-        # Deal with n_filters dimension increase
-        if n_filters_in != n_filters_out:
-            conv1x1 = nn.Conv1d(n_filters_in, n_filters_out, 1, bias=False)
-            skip_connection_layers += [conv1x1]
-
-        # Build skip connection layer
-        if skip_connection_layers:
-            self.skip_connection = nn.Sequential(*skip_connection_layers)
-        else:
-            self.skip_connection = None
-
-    def forward(self, x, y):
-        "Residual unit"
-        if self.skip_connection is not None:
-            y = self.skip_connection(y)
-        else:
-            y = y
-
-        # 1st layer
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.dropout1(x)
-
-        # 2nd layer
-        x = self.conv2(x)
-        x += y  # Sum skip connection and main connection
-        y = x
-        x = self.bn2(x)
-        x = self.relu(x)
-        x = self.dropout2(x)
-        return x, y
-
-class ResNet1D_Chagas(nn.Module): # 9,626,386 trainable parameters
-    """Residual network for unidimensional signals.
-    Parameters
-    ----------
-    input_dim : tuple
-        Input dimensions. Tuple containing dimensions for the neural network
-        input tensor. Should be like: ``(n_filters, n_samples)``.
-    blocks_dim : list of tuples
-        Dimensions of residual blocks.  The i-th tuple should contain the dimensions
-        of the output (i-1)-th residual block and the input to the i-th residual
-        block. Each tuple shoud be like: ``(n_filters, n_samples)``. `n_samples`
-        for two consecutive samples should always decrease by an integer factor.
-    dropout_rate: float [0, 1), optional
-        Dropout rate used in all Dropout layers. Default is 0.5
-    kernel_size: int, optional
-        Kernel size for convolutional layers. The current implementation
-        only supports odd kernel sizes. Default is 17.
-    References
-    ----------
-    .. [1] K. He, X. Zhang, S. Ren, and J. Sun, "Identity Mappings in Deep Residual Networks,"
-           arXiv:1603.05027, Mar. 2016. https://arxiv.org/pdf/1603.05027.pdf.
-    .. [2] K. He, X. Zhang, S. Ren, and J. Sun, "Deep Residual Learning for Image Recognition," in 2016 IEEE Conference
-           on Computer Vision and Pattern Recognition (CVPR), 2016, pp. 770-778. https://arxiv.org/pdf/1512.03385.pdf
-    """
-
-    def __init__(self, input_dim = (12, max_len), blocks_dim = list(zip([64, 128, 256, 512],[max_len, max_len//2, max_len//4, max_len//8])), n_classes=2, kernel_size=17, dropout_rate=0.5):
-        super(ResNet1D_Chagas, self).__init__()
-
-        # First layer
-        n_filters_in, n_filters_out = input_dim[0], blocks_dim[0][0]  # 12, 64
-        n_samples_in, n_samples_out = input_dim[1], blocks_dim[0][1]  # 4096, 4096
-        downsample = _downsample(n_samples_in, n_samples_out)
-        padding = _padding(downsample, kernel_size)
-        self.conv1 = nn.Conv1d(n_filters_in, n_filters_out, kernel_size, bias=False,
-                               stride=downsample, padding=padding)
-        self.bn1 = nn.BatchNorm1d(n_filters_out)
-        self.relu1 = nn.ReLU(inplace=True)
-
-        # Residual block layers
-        self.res_blocks = []
-        for i, (n_filters, n_samples) in enumerate(blocks_dim):
-            n_filters_in, n_filters_out = n_filters_out, n_filters
-            n_samples_in, n_samples_out = n_samples_out, n_samples
-            downsample = _downsample(n_samples_in, n_samples_out)
-            resblk1d = ResBlock1d(n_filters_in, n_filters_out, downsample, kernel_size, dropout_rate)
-            self.add_module('resblock1d_{nr}'.format(nr=i), resblk1d)  # make the resblocks actual modules (self.resblock_0 etc)
-            self.res_blocks += [resblk1d]
-
-        # Linear layer
-        n_filters_last, n_samples_last = blocks_dim[-1]
-        last_layer_dim = n_filters_last * n_samples_last
-        self.lin = nn.Linear(last_layer_dim, n_classes)
-
-        # number of residual blocks
-        self.n_blk = len(blocks_dim)
+# DropPath helper
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
 
     def forward(self, x):
-        # First layers
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu1(x)
+        return drop_path(x, self.drop_prob, self.training)
 
-        # Residual blocks
-        y = x
-        for blk in self.res_blocks:
-            x, y = blk(x, y)
+def drop_path(x, drop_prob=0.0, training=False):
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    return x.div(keep_prob) * random_tensor # rescales the output to preserve the expected value
 
-        # Flatten array
-        x = x.view(x.size(0), -1)
+# Global Response Normalization (GRN)
+class GRN(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta  = nn.Parameter(torch.zeros(dim))
+        self.eps   = eps
+    def forward(self, x):                    # x shape (B, L, C)  after transpose
+        g = torch.norm(x, p=2, dim=1, keepdim=True)  # global L2 norm across sequence per channel
+        x = x / (g + self.eps)
+        return self.gamma * x + self.beta
+    
+# 1D ConvNeXt V2 basic block
+class ConvNeXtV2Block1D(nn.Module):
+    def __init__(self, dim, drop_prob=0.0, layer_scale_init_value=1e-6):
+        super().__init__()
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv, no need to use large kernel_size
+        self.norm = nn.LayerNorm(dim)
+        self.pwconv1 = nn.Linear(dim, 4 * dim) # inverted bottleneck: 1x1 conv
+        self.grn = GRN(4 * dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(dim)) if layer_scale_init_value > 0 else None
+        self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
 
-        # Fully connected layer
-        x = self.lin(x)
+    def forward(self, x):
+        shortcut = x
+        x = self.dwconv(x)
+        x = x.transpose(1,2)  # (B, C, L) -> (B, L, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.grn(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.transpose(1,2)  # (B, L, C) -> (B, C, L)
+        x = shortcut + self.drop_path(x)
+        return x
+
+# 1D ConvNeXtV2 + Transformer model: ~10.34 million parameter for [64, 128, 256, 512]; ~ 2.37 million parameters for [32, 64, 128, 256]
+class ConvNeXtV2_1D_ECG(nn.Module):
+    def __init__(self, input_channels=12, num_classes=2):
+        super().__init__()
+        dims = [64, 128, 256, 512]  # Small dimensions [32, 64, 128, 256], try lareger dims like [64, 128, 256, 512] if data and compute allow
+        stages = [2, 2, 6, 2]       # Small block counts, try larger stages like [3, 3, 9, 3] if data and compute allow
+        drop_path_rate = 0.1
+
+        self.stem = nn.Sequential(
+            # non-overlapping convolution: stride = kernel_size ('patchify' like ViT), tried kernel_size = 7, 3, 5, 17, 21, 33, 65: 17 is the best
+            nn.Conv1d(input_channels, dims[0], kernel_size=17, stride=17),
+            nn.BatchNorm1d(dims[0]),
+            nn.GELU()
+        )
+
+        self.blocks = nn.ModuleList()
+        dp_rates = [drop_path_rate * (i / (sum(stages) - 1)) for i in range(sum(stages))]
+        cur = 0
+
+        for i, num_blocks in enumerate(stages):
+            stage = []
+            for j in range(num_blocks):
+                stage.append(ConvNeXtV2Block1D(dims[i], drop_prob=dp_rates[cur]))
+                cur += 1
+            self.blocks.append(nn.Sequential(*stage))
+
+            if i < len(stages) - 1:
+                self.blocks.append(nn.Sequential(
+                    nn.Conv1d(dims[i], dims[i+1], kernel_size=2, stride=2), # downsampling 
+                    nn.BatchNorm1d(dims[i+1])
+                ))
+
+        self.norm = nn.LayerNorm(dims[-1])
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+        # Global Attention Transformer Layer
+        self.global_attention = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=dims[-1], nhead=4, dim_feedforward=dims[-1]*2, dropout=0.1,        
+                batch_first=True,            # operates on [Batch, Seq, Channel] format
+            ),
+            num_layers=1,
+            enable_nested_tensor=True    # lets PyTorch pack padded inputs efficiently
+        )
+
+        self.dropout = nn.Dropout(0.3)
+        self.head = nn.Sequential(
+            nn.Linear(dims[-1], 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        
+        for block in self.blocks:
+            x = block(x)
+
+        x = x.transpose(1,2)
+        x = self.norm(x)
+        x = x.transpose(1,2)
+        pooled = self.pool(x).squeeze(-1)
+
+        # Global attention
+        global_feature = self.global_attention(x.transpose(1, 2))  # (B, L, C)
+        global_feature = global_feature.mean(dim=1)  # Mean pooling after attention
+
+        x = pooled + global_feature  # Merge pooled and global features
+
+        x = self.dropout(x)
+        x = self.head(x)
         return x
