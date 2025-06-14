@@ -21,7 +21,7 @@ elif device.type == 'cpu':
 THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease, add threshold optimization later
 source_string = '# Source:' # used to remove CODE 15% data from the traiing set
 CODE15 = 'CODE-15%' # used to remove CODE 15% data from the traiing set
-max_len = 4096 # (10.2s at 400Hz) must be power of 2 because of the 1d ResNet model from Screening for Chagas paper, 2020
+max_len = 4096 # (10.2s at 400Hz) must be power of 2 because of the 1d ResNet model from "Screening for Chagas" paper, 2023
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels):
@@ -230,8 +230,9 @@ def extract_ECG(record):
 
     return torch.tensor(signal, dtype=torch.float32)
 
-# ---------
-# Adapted code from github repo: https://github.com/antonior92/ecg-chagas/
+#---------
+# Adopted code from github repo: https://github.com/antonior92/ecg-chagas/
+# Original author: Antonio R. de la Torre, 2023
 
 def _padding(downsample, kernel_size):
     "Compute required padding"
@@ -309,7 +310,29 @@ class ResBlock1d(nn.Module):
         return x, y
 
 class ResNet1D_Chagas(nn.Module): # 9,626,386 trainable parameters
-    # Residual network for 1d ECG signals.
+    """Residual network for unidimensional signals.
+    Parameters
+    ----------
+    input_dim : tuple
+        Input dimensions. Tuple containing dimensions for the neural network
+        input tensor. Should be like: ``(n_filters, n_samples)``.
+    blocks_dim : list of tuples
+        Dimensions of residual blocks.  The i-th tuple should contain the dimensions
+        of the output (i-1)-th residual block and the input to the i-th residual
+        block. Each tuple shoud be like: ``(n_filters, n_samples)``. `n_samples`
+        for two consecutive samples should always decrease by an integer factor.
+    dropout_rate: float [0, 1), optional
+        Dropout rate used in all Dropout layers. Default is 0.5
+    kernel_size: int, optional
+        Kernel size for convolutional layers. The current implementation
+        only supports odd kernel sizes. Default is 17.
+    References
+    ----------
+    .. [1] K. He, X. Zhang, S. Ren, and J. Sun, "Identity Mappings in Deep Residual Networks,"
+           arXiv:1603.05027, Mar. 2016. https://arxiv.org/pdf/1603.05027.pdf.
+    .. [2] K. He, X. Zhang, S. Ren, and J. Sun, "Deep Residual Learning for Image Recognition," in 2016 IEEE Conference
+           on Computer Vision and Pattern Recognition (CVPR), 2016, pp. 770-778. https://arxiv.org/pdf/1512.03385.pdf
+    """
 
     def __init__(self, input_dim = (12, max_len), blocks_dim = list(zip([64, 128, 256, 512],[max_len, max_len//2, max_len//4, max_len//8])), n_classes=2, kernel_size=17, dropout_rate=0.5):
         super(ResNet1D_Chagas, self).__init__()
@@ -338,7 +361,6 @@ class ResNet1D_Chagas(nn.Module): # 9,626,386 trainable parameters
         n_filters_last, n_samples_last = blocks_dim[-1]
         last_layer_dim = n_filters_last * n_samples_last
         self.lin = nn.Linear(last_layer_dim, n_classes)
-        print(last_layer_dim)
 
         # number of residual blocks
         self.n_blk = len(blocks_dim)
