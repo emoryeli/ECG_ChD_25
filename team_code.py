@@ -326,6 +326,11 @@ def train_model(data_folder, model_folder, verbose):
 
             scheduler.step(avg_val_loss)
 
+            #f1 = compute_f_measure(val_labels, (np.array(val_outputs) > THRESHOLD_PROBABILITY).astype(int))
+            #best_threshold, best_f1 = compute_f1_and_thres(val_labels, np.array(val_outputs))
+            challenge_score = compute_challenge_score(np.array(val_labels), np.array(val_outputs))
+            #auroc, auprc = compute_auc(np.array(val_labels), np.array(val_outputs))
+
             gc.collect()  # free memory after each epoch
 
             if challenge_score > best_val_challenge_score: # use challenge score instead of validation loss
