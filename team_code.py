@@ -33,7 +33,7 @@ SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
 CODE15 = 'CODE-15%' # used to limit CODE-15% data size in the traiing set 
 ECG_len = 4096 #  4096 or 5000 or 2934: ?? double-check: all Chagas positives in CODE-15% are 2934 long
-EPOCHS = 20 # number of epochs to train the model
+EPOCHS = 10 # number of epochs to train the model
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels, smoothing_flags):
@@ -137,8 +137,6 @@ def joint_loss(
     """
     alpha: tradeoff parameter, 0=only custom_focal_loss, 1=only soft_topk_tpr
     """
-    #Clamp outputs to avoid NaN/Inf
-    outputs = torch.clamp(outputs, min=-20, max=20)
 
     # 1. Main (classification) loss
     loss_ce = custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=smoothing, gamma=gamma)
@@ -182,12 +180,10 @@ def train_model(data_folder, model_folder, verbose):
         print('Finding the training data...')
 
     # Find the records and add maximum MAX_CODE15 CODE-15% and max MAX_TOTAL total data from the training set 
-    # SaMi:CODE15%:PTB-XL:Total  1000:0:19000:20000; 1000:1000:18400:20400; 1000:5000:16000:22000; 1000:10000:13000:24000; 1000:15000:10000:26000; 1000:15000:9792:25792
-    # SaMi:CODE15%:PTB-XL:Total  1200:3000:21000:25200; 1631:19169:15744:36544 (might be too much data for training with 16vCPUs on AWS)
-    MAX_SAMI = 1631 # all positives
-    MAX_CODE15 = 19169 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
-    MAX_PTBXL = 15744 # all negatives from Europe not from the endemic region South America
-    MAX_TOTAL = 36544 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
+    MAX_SAMI = 1000 # all positives
+    MAX_CODE15 = 15000 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
+    MAX_PTBXL = 9920 # all negatives from Europe not from the endemic region South America
+    MAX_TOTAL = 25920 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
 
     all_records = find_records(data_folder)
     records = []
@@ -236,11 +232,8 @@ def train_model(data_folder, model_folder, verbose):
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     best_val_loss_overall = float('inf')
+    best_val_challenge_score_overall = 0.0
     best_model_state_overall = None
-
-    # Store training/validation loss for plotting
-    #all_train_losses = []
-    #all_val_losses = []
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(data_paths, labels), 1):
         if verbose:
@@ -264,9 +257,7 @@ def train_model(data_folder, model_folder, verbose):
         weight = torch.tensor([1.0, 19.0])  # assuming 5% positive -> 1:19 imbalance
 
         best_val_loss = float('inf')
-
-        #train_losses = []
-        #val_losses = []
+        best_val_challenge_score = 0.0
 
         # training loop
         for epoch in range(EPOCHS): 
@@ -287,38 +278,22 @@ def train_model(data_folder, model_folder, verbose):
                     smooth_flag.to(device), # bool tensor, shape (batch,)
                     weight,          # tensor([w_neg, w_pos])
                     smoothing=0.1,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
-                    gamma=1.0, # focusing parameter for focal loss
+                    gamma=0.5, # focusing parameter for focal loss
                     k_frac=0.05, # k for soft_topk_tpr_loss
                     temperature=0.05, # if too many FP's, increase temperature
                     alpha=0.3, # if too many FP's, decrease alpha
                 ) 
-                #if torch.isnan(loss):
-                #    print("NaN in loss!", loss, outputs, y)
-                #loss = custom_loss(outputs, y.to(device), smooth_flag.to(device), weight)
+
                 loss.backward()
 
                 # Gradient clipping
                 total_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                # check total gradient norm to ensure no exploding gradients:
-                #total_norm_after = 0.0
-                #for p in model.parameters():
-                #    if p.grad is not None:
-                #        param_norm = p.grad.data.norm(2)
-                #        total_norm_after += param_norm.item() ** 2
-                #total_norm_after = total_norm_after ** 0.5
-                #print(f"Grad Norm before: {total_norm_before:.3f}, after clipping: {total_norm_after:.3f}")
 
                 optimizer.step()
-
-                # Check model parameters for NaN or Inf
-                #for name, param in model.named_parameters():
-                #    if torch.isnan(param).any() or torch.isinf(param).any():
-                #        print(f"Model parameter {name} contains NaN or Inf!")
 
                 total_loss += loss.item() * X.size(0)
 
             avg_train_loss = total_loss / len(train_loader.dataset)
-            #train_losses.append(avg_train_loss)  # track train loss for plotting
 
             model.eval()
             val_loss = 0
@@ -329,11 +304,7 @@ def train_model(data_folder, model_folder, verbose):
             with torch.no_grad():
                 for X, y, smooth_flag in val_loader:
                     outputs = model(X.to(device))
-                    #if torch.isnan(outputs).any():
-                    #    print("NaN in model output! 1", outputs)
                     outputs = torch.clamp(outputs, min=-20, max=20)
-                    # Classic cross entropy for validation, no label smoothing:
-                    # loss = F.cross_entropy(outputs, y.to(device), weight=weight.to(device))
                     # TPR@5% loss for validation:
                     loss = joint_loss(
                         outputs,         # logits from model, shape (batch, 2)
@@ -341,91 +312,34 @@ def train_model(data_folder, model_folder, verbose):
                         smooth_flag.to(device), # bool tensor, shape (batch,)
                         weight,          # tensor([w_neg, w_pos])
                         smoothing=0.1,  # no label smoothing for validation
-                        gamma=1.0, # focusing parameter for focal loss, not used for validation
+                        gamma=0.5, # focusing parameter for focal loss, not used for validation
                         k_frac=0.05, # k for soft_topk_tpr_loss
                         temperature=0.05, # temperature for soft_topk_tpr_loss
                         alpha=0.3 # only use TPR@5% performance for validation, not cross entropy loss
                     )
-                    #if torch.isnan(loss):
-                    #    print("NaN in loss!", loss, outputs, y) 
                     val_loss += loss.item() * X.size(0)
                     probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas
-                    #if np.isnan(probs).any():
-                    #    print("NaN in model output! 2", outputs)
                     val_outputs.extend(probs.tolist())
                     val_targets.extend(y.cpu().numpy().tolist())
             avg_val_loss = val_loss / len(val_loader.dataset)
-            #val_losses.append(avg_val_loss)  # track val loss for plotting
+
 
             scheduler.step(avg_val_loss)
-            f1 = compute_f_measure(val_targets, (np.array(val_outputs) > THRESHOLD_PROBABILITY).astype(int))
-            best_threshold, best_f1 = compute_f1_and_thres(val_targets, np.array(val_outputs))
-            challenge_score = compute_challenge_score(np.array(val_targets), np.array(val_outputs))
-            auroc, auprc = compute_auc(np.array(val_targets), np.array(val_outputs))
 
             gc.collect()  # free memory after each epoch
-            
-            if verbose:
-                print(f"Fold {fold}, Epoch {epoch + 1}: "
-                    f"Train Loss = {avg_train_loss:.3f}, "
-                    f"Val Loss = {avg_val_loss:.3f}, "
-                    f"F1_0p5 = {f1:.3f}, "
-                    f"F1_Best = {best_f1:.3f}, "
-                    f"Thres_Best = {best_threshold:.3f}, "
-                    f"AUROC = {auroc:.3f}, "
-                    f"AUPRC = {auprc:.3f}, "
-                    f"Challenge Score = {challenge_score:.3f}, "
-                    f"LR = {optimizer.param_groups[0]['lr']:.2e}")
-                
-                # Check how many true positives are in top 5%
-                #val_targets = np.array(val_targets)
-                #val_outputs = np.array(val_outputs)
 
-                # sort by predicted probability and get top 5% indices and labels
-                #top5_indices = np.argsort(val_outputs)[::-1][:int(0.05 * len(val_outputs))]
-                #top5_labels = val_targets[top5_indices]
-
-                #print(f"Chagas instances among Top 5% probabilities: {np.sum(top5_labels)}. Total ground truth positives: {np.sum(val_targets)}.")
-                #print(len(val_outputs))
-                #print(len(val_targets))
-                #print(f"top 5% indices: {top5_indices}")
-                #print(f"top 5% labels: {top5_labels}")
-                #all_indices = np.argsort(val_outputs)[::-1][:int(len(val_outputs))]
-                #print("orded labels:", val_targets[all_indices])
-                #print("predicted probabilities:", np.sort(val_outputs)[::-1])
-                #print('Fold', fold, 'Epoch', epoch + 1, 'Ended')
-
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            if challenge_score > best_val_challenge_score: # use challenge score instead of validation loss
+                best_val_challenge_score = challenge_score
                 best_model_state = model.state_dict()
 
             os.makedirs(model_folder, exist_ok=True)
             torch.save({'model_state_dict': best_model_state}, os.path.join(model_folder, 'model.pt'))
 
-        #all_train_losses.append(train_losses) # training loss for plotting
-        #all_val_losses.append(val_losses) # validation loss for plotting
-
-        if best_val_loss < best_val_loss_overall:
-            best_val_loss_overall = best_val_loss
+        if best_val_challenge_score > best_val_challenge_score_overall: # use challenge score instead of validation loss
+            best_val_challenge_score_overall = best_val_challenge_score
             best_model_state_overall = best_model_state
 
-    #os.makedirs(model_folder, exist_ok=True)
     torch.save({'model_state_dict': best_model_state_overall}, os.path.join(model_folder, 'model.pt'))
-
-    """ if verbose:
-        # --- Plot Loss Curves ---
-        plt.figure(figsize=(10, 6))
-        for fold, (train_l, val_l) in enumerate(zip(all_train_losses, all_val_losses), 1):
-            plt.plot(train_l, label=f'Fold {fold} Train')
-            plt.plot(val_l, '--', label=f'Fold {fold} Val')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training & Validation Loss Curves (All Folds)')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-        print(f"\nBest model saved with validation loss: {best_val_loss_overall:.4f}") """
 
 def save_model(model_folder, model):
     os.makedirs(model_folder, exist_ok=True)
@@ -475,22 +389,13 @@ def extract_ECG(record):
     else: # random cropping for data augmentation
         signal = random_crop(signal, target_length=ECG_len)
 
-    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.5, 150], augment=True, target_length=ECG_len)
+    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.05, 150], augment=True, target_length=ECG_len)
     assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
 
     return torch.tensor(signal.copy(), dtype=torch.float32)
 
 # ECG pre-processing functions:
 # some adapted from https://github.com/antonior92/ecg-preprocessing/
-""" def remove_baseline_butterworth_filter(sample_rate=400):
-    # Butterworth highpass filter design, preferred to elliptic filters for ECG baseline wanter removal
-    fc = 0.5  # [Hz], cutoff frequency, 0.5-0.7 Hz, never above 0.8Hz which will distort T wave and ST segment
-    order = 3  # Butterworth order (standard is 2-4 for ECG)
-    nyquist = 0.5 * sample_rate
-    wn = fc / nyquist  # Normalized frequency (0-1)
-    sos = sgn.butter(order, wn, btype='highpass', output='sos')
-    return sos """
-
 def remove_baseline_wavelet_filter(ecg_12lead, wavelet='sym8', level=7): # or 8
     """
     Baseline removal for 12-lead ECG with shape (12, length)
@@ -515,7 +420,7 @@ def remove_powerline_filter(powerline_freq=60, sample_rate=400): # 60 Hz for US,
     b, a = sgn.iirnotch(powerline_freq, q, fs=sample_rate)
     return b, a 
 
-def bandpass_filter(bandwidth=[1, 47], sample_rate=400):
+def bandpass_filter(bandwidth=[0.05, 150], sample_rate=400):
     # --- Bandpass filtering with Butterworth bandpass filter (zero-phase) ---
     # 3rd order Butterworth, passband: [0.5, 47] Hz
     nyquist = 0.5 * sample_rate
@@ -577,7 +482,7 @@ def add_baseline_wander(signal, sample_rate=400, max_ampl=0.1, freq_range=(0.15,
     drift = amp * np.sin(2 * np.pi * freq * t + phase)
     return signal + drift
 
-def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=[1, 47], augment=False, target_length=ECG_len):
+def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=[0.05, 150], augment=False, target_length=ECG_len):
     # signal shape: (samples,) or (channels, samples)
     x = signal
 
