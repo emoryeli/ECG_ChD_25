@@ -9,3 +9,5 @@ WORKDIR /challenge
 
 ## install python tools
 RUN pip install -r requirements.txt
+# After running requirements.txt, install torch with CUDA.
+# RUN pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121
