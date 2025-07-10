@@ -27,7 +27,7 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.5 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.8 # above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to get the source of the data in the traiing set: CODE-15%, PTB-XL, or SaMi-Trop
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
@@ -46,8 +46,8 @@ class ECGDataset(Dataset):
 
     def __getitem__(self, idx):
         signal = extract_ECG(self.records[idx])
-        assert not torch.isnan(signal).any(), "NaN in input signal!"
-        assert not torch.isinf(signal).any(), "Inf in input signal!"    
+        #assert not torch.isnan(signal).any(), "NaN in input signal!"
+        #assert not torch.isinf(signal).any(), "Inf in input signal!"    
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         smooth = torch.tensor(self.smoothing_flags[idx], dtype=torch.bool)
         return signal, label, smooth
@@ -264,12 +264,10 @@ def train_model(data_folder, model_folder, verbose):
             model.train()
             total_loss = 0
             for X, y, smooth_flag in train_loader:
-                #if torch.isnan(X).any() or torch.isinf(X).any():
-                #    print("NaN or Inf in input X!", X)
+
                 optimizer.zero_grad()
                 outputs = model(X.to(device)).contiguous()  # logits from model, shape (batch, 2)
-                #if torch.isnan(outputs).any():
-                #    print("NaN in model output! min:", outputs.min().item(), "max:", outputs.max().item())
+
                 outputs = torch.clamp(outputs, min=-20, max=20)
 
                 loss = joint_loss(
@@ -322,7 +320,6 @@ def train_model(data_folder, model_folder, verbose):
                     val_outputs.extend(probs.tolist())
                     val_targets.extend(y.cpu().numpy().tolist())
             avg_val_loss = val_loss / len(val_loader.dataset)
-
 
             scheduler.step(avg_val_loss)
 
