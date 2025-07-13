@@ -10,11 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
-from scipy.signal import resample_poly  # for resampling ECG signals to 400Hz
-from math import gcd
+from scipy.signal import resample_poly  # for resampling ECG signals from different sources to 400Hz
+from math import gcd # for computing upsample and downsample factors for resampling ECG signals
 import scipy.signal as sgn
 import pywt # wavelet filter for baseline removal
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 from helper_code import *
 
@@ -27,7 +28,7 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.8 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.84 # run_model() uses this parameter: above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to get the source of the data in the traiing set: CODE-15%, PTB-XL, or SaMi-Trop
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
@@ -52,16 +53,16 @@ class ECGDataset(Dataset):
         smooth = torch.tensor(self.smoothing_flags[idx], dtype=torch.bool)
         return signal, label, smooth
 
-# custom Focal loss function with weighted label and label smoothing on CODE-15% data 
-def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, gamma=1.0):
+# custom Focal loss function with weighted class and label-smoothing on CODE-15% data 
+def custom_focal_loss(outputs, labels, smoothing_flags, weight, smoothing=0.1, gamma=0.5):
     # outputs: logits (batch, num_classes)
-    # targets: class indices (batch,)
+    # labels: class indices (batch,)
     # smoothing_flags: (batch,)
     # weight: (num_classes,) class weights, e.g., torch.tensor([1.0, 19.0])
     # gamma: focusing parameter
     # smoothing: label smoothing value
 
-    #Clamp outputs to avoid NaN/Inf
+    #Clamp outputs to avoid Inf
     outputs = torch.clamp(outputs, min=-20, max=20)
 
     num_classes = outputs.shape[1]
@@ -70,7 +71,7 @@ def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, 
     # Label smoothing
     with torch.no_grad():
         true_dist = torch.zeros_like(outputs)# (batch, num_classes = 2)
-        true_dist.scatter_(1, targets.unsqueeze(1), 1)
+        true_dist.scatter_(1, labels.unsqueeze(1), 1)
         mask = smoothing_flags.unsqueeze(1)  # (batch, 1), bool
         true_dist = torch.where(
             mask,
@@ -81,6 +82,10 @@ def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, 
     # Log-softmax and softmax
     log_probs = F.log_softmax(outputs, dim=1)  # (batch, num_classes)
     probs = log_probs.exp()                    # (batch, num_classes)
+
+    #assert not torch.isnan(log_probs).any(), "NaN in log_probs"
+    #assert not torch.isnan(probs).any(), "NaN in probs"
+    #assert (probs >= 0).all() and (probs <= 1).all(), "probs out of range"
 
     # Focal Loss term: (1 - pt) ** gamma
     focal_term = (1.0 - probs) ** gamma
@@ -94,16 +99,16 @@ def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, 
     return loss
 
 # Softmax (sigmoid for binary) approximated top-k true positive rate loss that is differentiable
-def soft_topk_tpr_loss(outputs, targets, k_frac=0.05, temperature=0.05):
+def soft_topk_tpr_loss(outputs, labels, k_frac=0.05, temperature=0.05):
     """
     outputs: (batch,) - logits or scores, higher = more positive
-    targets: (batch,) - binary ground truth (0 or 1)
+    labels: (batch,) - binary ground truth (0 or 1)
     k_frac: fraction of batch to be considered "top k" (e.g., 0.05 for top 5%)
     temperature: controls sharpness, lower = harder selection
     """
 
-    #Clamp outputs to avoid NaN/Inf
-    outputs = torch.clamp(outputs, min=-20, max=20)
+    #Clamp outputs to avoid Inf
+    #outputs = torch.clamp(outputs, min=-20, max=20)
 
     batch_size = outputs.shape[0]
     k = int(k_frac * batch_size)
@@ -117,19 +122,19 @@ def soft_topk_tpr_loss(outputs, targets, k_frac=0.05, temperature=0.05):
     soft_topk_weights = torch.clamp(soft_topk_weights, max=1.0)  # avoid "overshooting"
 
     # Expected true positives in top-k
-    tps = (soft_topk_weights * targets).sum()
-    total_positives = targets.sum().clamp(min=1)
+    tps = (soft_topk_weights * labels).sum()
+    total_positives = labels.sum().clamp(min=1)
 
     tpr_at_k = tps / total_positives
     loss = 1 - tpr_at_k
     return loss
 
 def joint_loss(
-    outputs, targets, 
+    outputs, labels, 
     smoothing_flags, # bool tensor for label smoothing, shape (batch,), True only for CODE-15% data 
     weight, # tensor([w_neg, w_pos]) for class weights
     smoothing=0.1, # label smoothing for weakly labeled CODE-15% data
-    gamma=1.0, # focusing parameter for focal loss
+    gamma=0.5, # focusing parameter for focal loss
     k_frac=0.05,   # fraction of batch to be considered "top k" (e.g., 0.05 for top 5%)
     temperature=0.05, # temperature for soft_topk_tpr_loss
     alpha=0.3  # tradeoff parameter, 0=only custom_focal_loss, 1=only soft_topk_tpr
@@ -137,15 +142,17 @@ def joint_loss(
     """
     alpha: tradeoff parameter, 0=only custom_focal_loss, 1=only soft_topk_tpr
     """
+    #Clamp outputs to avoid Inf
+    #outputs = torch.clamp(outputs, min=-20, max=20)
 
     # 1. Main (classification) loss
-    loss_ce = custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=smoothing, gamma=gamma)
+    loss_ce = custom_focal_loss(outputs, labels, smoothing_flags, weight, smoothing=smoothing, gamma=gamma)
     # 2. Ranking loss on positive class only (class 1)
     pos_outputs = outputs[:, 1]          # logits for class 1
-    pos_labels = (targets == 1).float()  # binary 0/1
+    pos_labels = (labels == 1).float()  # binary 0/1
     loss_tpr = soft_topk_tpr_loss(
         outputs=pos_outputs,
-        targets=pos_labels,
+        labels=pos_labels,
         k_frac=k_frac,
         temperature=temperature
     )
@@ -180,10 +187,12 @@ def train_model(data_folder, model_folder, verbose):
         print('Finding the training data...')
 
     # Find the records and add maximum MAX_CODE15 CODE-15% and max MAX_TOTAL total data from the training set 
+    # SaMi:CODE15%:PTB-XL:Total  1000:0:19160:20160; 1000:1000:18480:20480; 1000:5000:16080:22080; 1000:10000:13000:24000; 1000:15000:10240:26240; 1000:14000:10920:25920
+    # SaMi:CODE15%:PTB-XL:Total  1200:3080:21000:25280; 1631:12000:10369:24000; 1631:19169:15800:36800 (might be too much data for training with 16vCPUs on AWS)
     MAX_SAMI = 1000 # all positives
-    MAX_CODE15 = 15000 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
-    MAX_PTBXL = 9920 # all negatives from Europe not from the endemic region South America
-    MAX_TOTAL = 25920 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
+    MAX_CODE15 = 14000 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
+    MAX_PTBXL = 10920 # all negatives from Europe not from the endemic region South America
+    MAX_TOTAL = 25920 # mutiples of batch_size*fold_size=320 to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
 
     all_records = find_records(data_folder)
     records = []
@@ -230,10 +239,14 @@ def train_model(data_folder, model_folder, verbose):
     labels = np.array(labels)
     label_smoothing_flags = np.array(label_smoothing_flags)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=12345)
     best_val_loss_overall = float('inf')
     best_val_challenge_score_overall = 0.0
     best_model_state_overall = None
+
+    # Store training/validation loss for plotting
+    #all_train_losses = []
+    #all_val_losses = []
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(data_paths, labels), 1):
         if verbose:
@@ -252,96 +265,197 @@ def train_model(data_folder, model_folder, verbose):
         val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=12, pin_memory=True, drop_last=True)
 
         model = EfficientNetB3_1D().to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-        weight = torch.tensor([1.0, 19.0])  # assuming 5% positive -> 1:19 imbalance
+        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-2)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=2)
+        weight = torch.tensor([1.0, 19.0])  # assuming 5% positive -> 1:19 imbalance; [1.0, 12.9] for 7.75% positives: 1631:12000:10369:24000
 
         best_val_loss = float('inf')
         best_val_challenge_score = 0.0
+
+        #train_losses = []
+        #val_losses = []
+
+        torch.autograd.set_detect_anomaly(True)
 
         # training loop
         for epoch in range(EPOCHS): 
             model.train()
             total_loss = 0
             for X, y, smooth_flag in train_loader:
-
+                #assert not torch.isnan(X).any() and not torch.isinf(X).any(), "Input contains NaN or Inf!"
+                #assert not torch.isnan(y).any() and not torch.isinf(y).any(), "Labels contain NaN or Inf!"
+                #assert not torch.isnan(smooth_flag).any() and not torch.isinf(smooth_flag).any(), "smooth_flag contains NaN or Inf!"
+                #if torch.isnan(X).any() or torch.isinf(X).any():
+                #    print("NaN or Inf in input X!", X)
                 optimizer.zero_grad()
-                outputs = model(X.to(device)).contiguous()  # logits from model, shape (batch, 2)
-
+                outputs = model(X.to(device)).contiguous()  # logits from model, shape (batch, 2), sometimes give nan or inf (due to NaN/Inf model parameters?)
+                #if torch.isnan(outputs).any():
+                #    print("NaN in model output! min:", outputs.min().item(), "max:", outputs.max().item())
                 outputs = torch.clamp(outputs, min=-20, max=20)
+                #assert not torch.isnan(outputs).any(), "NaN in outputs before loss"
+                #assert not torch.isinf(outputs).any(), "Inf in outputs before loss"
 
                 loss = joint_loss(
                     outputs,         # logits from model, shape (batch, 2)
-                    y.to(device),         # int64 tensor, shape (batch,)
+                    y.to(device),         # int64 tensor, shape (batch,), labels
                     smooth_flag.to(device), # bool tensor, shape (batch,)
                     weight,          # tensor([w_neg, w_pos])
                     smoothing=0.1,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
-                    gamma=0.5, # focusing parameter for focal loss
+                    gamma=1.0, # focusing parameter for focal loss
                     k_frac=0.05, # k for soft_topk_tpr_loss
                     temperature=0.05, # if too many FP's, increase temperature
                     alpha=0.3, # if too many FP's, decrease alpha
                 ) 
+                #if torch.isnan(loss):
+                #    print("NaN in loss!") #, loss, outputs, y 
 
                 loss.backward()
 
                 # Gradient clipping
-                total_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                total_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0) # 1.0 - 10.0, Gradient clipping for long ECG sequences
+                # check total gradient norm to ensure no exploding gradients:
+                """ total_norm_after = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm_after += param_norm.item() ** 2
+                total_norm_after = total_norm_after ** 0.5
+                print(f"Grad Norm before: {total_norm_before:.3f}, after clipping: {total_norm_after:.3f}") """
 
                 optimizer.step()
+
+                # Check model parameters for NaN or Inf
+                #for name, param in model.named_parameters():
+                #    if torch.isnan(param).any() or torch.isinf(param).any():
+                #        print(f"Model parameter {name} contains NaN or Inf!")
 
                 total_loss += loss.item() * X.size(0)
 
             avg_train_loss = total_loss / len(train_loader.dataset)
+            #train_losses.append(avg_train_loss)  # track train loss for plotting
 
             model.eval()
             val_loss = 0
             val_outputs = [] #predicted probabilities, float64
-            val_targets = [] #labels, 0 or 1
+            val_labels = [] #labels, 0 or 1
             
             # validation loop
             with torch.no_grad():
                 for X, y, smooth_flag in val_loader:
+                    #assert not torch.isnan(X).any() and not torch.isinf(X).any(), "Input contains NaN or Inf!"
+                    #assert not torch.isnan(y).any() and not torch.isinf(y).any(), "Labels contain NaN or Inf!"
+                    #assert not torch.isnan(smooth_flag).any() and not torch.isinf(smooth_flag).any(), "smooth_flag contains NaN or Inf!"
+
                     outputs = model(X.to(device))
+                    #if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                    #    print("NaN or Inf in model output!", outputs)
                     outputs = torch.clamp(outputs, min=-20, max=20)
+                    # Classic cross entropy for validation, no label smoothing:
+                    # loss = F.cross_entropy(outputs, y.to(device), weight=weight.to(device))
                     # TPR@5% loss for validation:
                     loss = joint_loss(
                         outputs,         # logits from model, shape (batch, 2)
                         y.to(device),         # int64 tensor, shape (batch,)
-                        smooth_flag.to(device), # bool tensor, shape (batch,)
-                        weight,          # tensor([w_neg, w_pos])
+                        smooth_flag.to(device), # bool tensor, shape (batch,), smoothing flags (only smooth CODE-15% data)
+                        weight,          # tensor([w_neg, w_pos]) for weighting classes
                         smoothing=0.1,  # no label smoothing for validation
-                        gamma=0.5, # focusing parameter for focal loss, not used for validation
+                        gamma=1.0, # focusing parameter for Focal loss, not used for validation
                         k_frac=0.05, # k for soft_topk_tpr_loss
                         temperature=0.05, # temperature for soft_topk_tpr_loss
                         alpha=0.3 # only use TPR@5% performance for validation, not cross entropy loss
                     )
+                    #if torch.isnan(loss) or torch.isinf(loss):
+                    #    print("NaN or Inf in loss!", loss, outputs, y)
+
                     val_loss += loss.item() * X.size(0)
-                    probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas
+                    probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1 (Chagas disease)
+                    #if np.isnan(probs).any() or np.isinf(probs).any():
+                    #    print("NaN or Inf in softmax probabilities!", probs)
+                    #if torch.isnan(outputs).any():
+                    #    print("NaN in model output! 2", outputs)
                     val_outputs.extend(probs.tolist())
-                    val_targets.extend(y.cpu().numpy().tolist())
+                    val_labels.extend(y.cpu().numpy().tolist())
             avg_val_loss = val_loss / len(val_loader.dataset)
+            #val_losses.append(avg_val_loss)  # track val loss for plotting
 
             scheduler.step(avg_val_loss)
 
+            #print('NaN in labels:', np.isnan(labels).any())
+            #print('NaN in outputs:', torch.isnan(outputs).any().item())
+
             #f1 = compute_f_measure(val_labels, (np.array(val_outputs) > THRESHOLD_PROBABILITY).astype(int))
-            #best_threshold, best_f1 = compute_f1_and_thres(val_labels, np.array(val_outputs))
+            best_threshold, best_f1 = compute_f1_and_thres(val_labels, np.array(val_outputs))
             challenge_score = compute_challenge_score(np.array(val_labels), np.array(val_outputs))
-            #auroc, auprc = compute_auc(np.array(val_labels), np.array(val_outputs))
+            auroc, auprc = compute_auc(np.array(val_labels), np.array(val_outputs))
 
             gc.collect()  # free memory after each epoch
+            
+            if verbose:
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Fold {fold}, Epoch {epoch + 1}: "
+                    f"Train Loss = {avg_train_loss:.3f}, "
+                    f"Val Loss = {avg_val_loss:.3f}, "
+                    #f"F1_0p5 = {f1:.3f}, "
+                    f"F1_Best = {best_f1:.3f}, "
+                    f"Thres_Best = {best_threshold:.3f}, "
+                    f"AUROC = {auroc:.3f}, "
+                    f"AUPRC = {auprc:.3f}, "
+                    f"Challenge Score = {challenge_score:.3f}, "
+                    f"LR = {optimizer.param_groups[0]['lr']:.2e}")
+                
+                # Check how many true positives are in top 5%
+                #val_labels = np.array(val_labels)
+                #val_outputs = np.array(val_outputs)
 
+                # sort by predicted probability and get top 5% indices and labels
+                #top5_indices = np.argsort(val_outputs)[::-1][:int(0.05 * len(val_outputs))]
+                #top5_labels = val_labels[top5_indices]
+
+                #print(f"Chagas instances among Top 5% probabilities: {np.sum(top5_labels)}. Total ground truth positives: {np.sum(val_labels)}.")
+                #print(len(val_outputs))
+                #print(len(val_labels))
+                #print(f"top 5% indices: {top5_indices}")
+                #print(f"top 5% labels: {top5_labels}")
+                #all_indices = np.argsort(val_outputs)[::-1][:int(len(val_outputs))]
+                #print("orded labels:", val_labels[all_indices])
+                #print("predicted probabilities:", np.sort(val_outputs)[::-1])
+                #print('Fold', fold, 'Epoch', epoch + 1, 'Ended')
+
+            #if avg_val_loss < best_val_loss:
             if challenge_score > best_val_challenge_score: # use challenge score instead of validation loss
+                #best_val_loss = avg_val_loss
                 best_val_challenge_score = challenge_score
                 best_model_state = model.state_dict()
 
             os.makedirs(model_folder, exist_ok=True)
             torch.save({'model_state_dict': best_model_state}, os.path.join(model_folder, 'model.pt'))
 
+        #all_train_losses.append(train_losses) # training loss for plotting
+        #all_val_losses.append(val_losses) # validation loss for plotting
+
+        #if best_val_loss < best_val_loss_overall:
         if best_val_challenge_score > best_val_challenge_score_overall: # use challenge score instead of validation loss
+            #best_val_loss_overall = best_val_loss
             best_val_challenge_score_overall = best_val_challenge_score
             best_model_state_overall = best_model_state
 
+    #os.makedirs(model_folder, exist_ok=True)
     torch.save({'model_state_dict': best_model_state_overall}, os.path.join(model_folder, 'model.pt'))
+
+    """ if verbose:
+        # --- Plot Loss Curves ---
+        plt.figure(figsize=(10, 6))
+        for fold, (train_l, val_l) in enumerate(zip(all_train_losses, all_val_losses), 1):
+            plt.plot(train_l, label=f'Fold {fold} Train')
+            plt.plot(val_l, '--', label=f'Fold {fold} Val')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training & Validation Loss Curves (All Folds)')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+        print(f"\nBest model saved with validation loss: {best_val_loss_overall:.4f}") """
 
 def save_model(model_folder, model):
     os.makedirs(model_folder, exist_ok=True)
@@ -363,7 +477,7 @@ def run_model(record, model, verbose):
 
 def extract_ECG(record):
     # Load signal as (samples, leads), and header as text string
-    signal, _ = load_signals(record)
+    signal, _ = load_signals(record) # numpy array, shape (samples, leads)
     header = load_header(record)
 
     # Get sampling frequency
@@ -392,19 +506,28 @@ def extract_ECG(record):
         signal = random_crop(signal, target_length=ECG_len)
 
     signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.05, 150], augment=True, target_length=ECG_len)
-    assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
+    #assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
 
     return torch.tensor(signal.copy(), dtype=torch.float32)
 
 # ECG pre-processing functions:
 # some adapted from https://github.com/antonior92/ecg-preprocessing/
+""" def remove_baseline_butterworth_filter(sample_rate=400):
+    # Butterworth highpass filter design, preferred to elliptic filters for ECG baseline wanter removal
+    fc = 0.5  # [Hz], cutoff frequency, 0.5-0.7 Hz, never above 0.8Hz which will distort T wave and ST segment
+    order = 3  # Butterworth order (standard is 2-4 for ECG)
+    nyquist = 0.5 * sample_rate
+    wn = fc / nyquist  # Normalized frequency (0-1)
+    sos = sgn.butter(order, wn, btype='highpass', output='sos')
+    return sos """
+
 def remove_baseline_wavelet_filter(ecg_12lead, wavelet='sym8', level=7): # or 8
     """
     Baseline removal for 12-lead ECG with shape (12, length)
     ecg_12lead: 12 lead ECG (12, length)
-    wavelet:  Wavelet type (e.g., 'sym8' or Daubechies 6 'db6' is commonly used for ECG)
+    wavelet:  Wavelet type (e.g., 'sym8' and Daubechies 6 'db6' are commonly used for ECG)
     level:  Decomposition level (higher = slower baseline removed, level 8 for 400hz sampling rate removes frequencies slower than ~0.78 Hz)
-    level 9 (0.039hz) is too high for 4096 length
+    level 9 (0.039hz) is too high for 4096 length, level 8 is too high for 2934 length
     Returns: cleaned ECG, same shape (12, length)
     """
     leads, length = ecg_12lead.shape
@@ -424,7 +547,7 @@ def remove_powerline_filter(powerline_freq=60, sample_rate=400): # 60 Hz for US,
 
 def bandpass_filter(bandwidth=[0.05, 150], sample_rate=400):
     # --- Bandpass filtering with Butterworth bandpass filter (zero-phase) ---
-    # 3rd order Butterworth, passband: [0.5, 47] Hz
+    # 3rd order Butterworth, passband: [0.5, 150] Hz
     nyquist = 0.5 * sample_rate
     low = bandwidth[0] / nyquist
     high = bandwidth[1] / nyquist
@@ -516,7 +639,7 @@ def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=
     # Remove padding
     x = x[:, pad_width:-pad_width]  
 
-    # Remove edge artifacts: the first and last 0.25 seconds 
+    # Remove edge artifacts in the first and last 0.25 seconds 
     # (first 100 and last 100 samples, since 400 Hz × 0.25 s = 100)
     # replace with the mean of the lead:
     #x[:, :100] = x[:, -100:] = np.nanmean(x, axis=1, keepdims=True)
@@ -526,7 +649,7 @@ def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=
     # Normalize the signal - z-score normalization
     x = normalize_signal(x)
 
-    # ECG signal augementation:
+    # ECG signal augmentation:
     if augment:
         # 1. Random crop to target length
         # already done in extract_ECG()
@@ -546,6 +669,9 @@ def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=
         # 6. Optional: add baseline wander
         # if np.random.rand() < 0.2:
         #     x = add_baseline_wander(x, sample_rate)
+
+    #x = np.nan_to_num(x)  # replace NaN with 0.0
+        
     return x
 
 # Squeeze-and-Excitation block for 1D data
@@ -624,6 +750,9 @@ class EfficientNetB3_1D(nn.Module):
                     )
                 )
                 in_ch = chs[idx]
+            # Add Dropout(0.2) **after each group** of repeated blocks except the last
+            #if idx < len(chs) - 1:
+            #    blocks.append(nn.Dropout(0.2))
         self.blocks = nn.Sequential(*blocks)
 
         self.head = nn.Sequential(
