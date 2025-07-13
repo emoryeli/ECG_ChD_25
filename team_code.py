@@ -301,7 +301,7 @@ def train_model(data_folder, model_folder, verbose):
                     smooth_flag.to(device), # bool tensor, shape (batch,)
                     weight,          # tensor([w_neg, w_pos])
                     smoothing=0.1,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
-                    gamma=1.0, # focusing parameter for focal loss
+                    gamma=0.5, # focusing parameter for focal loss
                     k_frac=0.05, # k for soft_topk_tpr_loss
                     temperature=0.05, # if too many FP's, increase temperature
                     alpha=0.3, # if too many FP's, decrease alpha
@@ -359,7 +359,7 @@ def train_model(data_folder, model_folder, verbose):
                         smooth_flag.to(device), # bool tensor, shape (batch,), smoothing flags (only smooth CODE-15% data)
                         weight,          # tensor([w_neg, w_pos]) for weighting classes
                         smoothing=0.1,  # no label smoothing for validation
-                        gamma=1.0, # focusing parameter for Focal loss, not used for validation
+                        gamma=0.5, # focusing parameter for Focal loss, not used for validation
                         k_frac=0.05, # k for soft_topk_tpr_loss
                         temperature=0.05, # temperature for soft_topk_tpr_loss
                         alpha=0.3 # only use TPR@5% performance for validation, not cross entropy loss
