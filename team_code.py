@@ -28,7 +28,7 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.67 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.73 # above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to get the source of the data in the traiing set: CODE-15%, PTB-XL, or SaMi-Trop
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
