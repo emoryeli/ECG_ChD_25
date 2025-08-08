@@ -14,8 +14,6 @@ from scipy.signal import resample_poly  # for resampling ECG signals to 400Hz
 from math import gcd
 import scipy.signal as sgn
 import pywt # wavelet filter for baseline removal
-#import matplotlib.pyplot as plt
-#from datetime import datetime
 
 from helper_code import *
 
@@ -28,14 +26,14 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.76 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.7 # above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to get the source of the data in the traiing set: CODE-15%, PTB-XL, or SaMi-Trop
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
 CODE15 = 'CODE-15%' # used to limit CODE-15% data size in the traiing set 
-POSITIVE_RATIO = 0.1 # positive ratio in the training set, used for balanced sampling
+POSITIVE_RATIO = 0.1 # positive ratio in the training set, used for over sampling positives
 ECG_len = 4096 #  4096 or 5000 or 2934: ?? double-check: all Chagas positives in CODE-15% are 2934 long
-EPOCHS = 15 # number of epochs to train the model
+EPOCHS = 10 # number of epochs to train the model
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels, smoothing_flags, augment=False):
@@ -61,9 +59,6 @@ def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, 
     # weight: (num_classes,) class weights, e.g., torch.tensor([1.0, 19.0])
     # gamma: focusing parameter
     # smoothing: label smoothing value
-
-    #Clamp outputs to avoid NaN/Inf
-    #outputs = torch.clamp(outputs, min=-20, max=20)
 
     num_classes = outputs.shape[1]
     device = outputs.device
@@ -116,42 +111,32 @@ def compute_f1_and_thres(labels, probs, steps=100):
             best_threshold = th
     return best_threshold, best_f1
 
-# Balanced sampling - ensures every batch has 30% positives
-def create_balanced_dataloader(dataset, labels, batch_size=64, positive_ratio=0.3):
-    """
-    Create a dataloader that ensures each batch has roughly positive_ratio positive examples
-    """
-    # Calculate sampling weights
-    class_counts = np.bincount(labels)
-    class_weights = 1.0 / class_counts
-    sample_weights = class_weights[labels]
+# oversample positives to positive_ratio of overall data (not per epoch)
+def create_oversampled_dataloader(dataset, labels, batch_size=64, positive_ratio=0.1, num_workers=12):
+    labels = np.array(labels)
+    pos = (labels == 1)
+    neg = (labels == 0)
+    n_pos = pos.sum()
+    n_neg = neg.sum()
     
-    # Create weighted sampler
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
+    # Set weights so that sampled positives ≈ positive_ratio
+    pos_weight = positive_ratio / (1 - positive_ratio) * n_neg / n_pos 
+    neg_weight = 1
+    weights = np.where(labels == 1, pos_weight, neg_weight)
     
-    return DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        sampler=sampler,  # This ensures balanced batches
-        num_workers=12, 
-        pin_memory=True,
-        drop_last=True
-    )
+    sampler = WeightedRandomSampler(weights, len(labels), replacement=True)
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, drop_last=True)
 
 def train_model(data_folder, model_folder, verbose):
     if verbose:
         print('Finding the training data...')
 
     # Find the records and add maximum MAX_CODE15 CODE-15% and max MAX_TOTAL total data from the training set 
-    # 1631:90769:10000:102400 SaMi:CODE15%:PTB-XL:Total (1: 15.7: 6.1)
+    # 1631:90769:10000:102400 SaMi:CODE15%:PTB-XL:Total (1: 15.7: 6.1); 1000:40200:10000:51200; 1000:91400:10000:102400; 1000:193800:10000:204800
     MAX_SAMI = 1631 # all positives
-    MAX_CODE15 = 90769 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
+    MAX_CODE15 = 39569 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
     MAX_PTBXL = 10000 # all negatives from Europe not from the endemic region South America
-    MAX_TOTAL = 102400 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
+    MAX_TOTAL = 51200 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
 
     all_records = find_records(data_folder)
     records = []
@@ -182,8 +167,6 @@ def train_model(data_folder, model_folder, verbose):
                 label_smoothing_flags.append(True) # label smoothing only on CODE-15% data
                 code15_count += 1
             # else: skip, as we've already added maximum CODE-15% records
-        #else:
-        #    records.append(record)
 
     if len(records) == 0:
         raise FileNotFoundError('No useful data were provided.')
@@ -215,18 +198,15 @@ def train_model(data_folder, model_folder, verbose):
 
         train_dataset = ECGDataset(train_records, train_labels, train_smoothing_flags, augment=True)
         val_dataset = ECGDataset(val_records, val_labels, val_smoothing_flags, augment=False)
-        #train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=12, pin_memory=True, drop_last=True)
-        train_loader = create_balanced_dataloader(train_dataset, train_labels, batch_size=64, positive_ratio=POSITIVE_RATIO)
-        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=12, pin_memory=True, drop_last=True)
+        train_loader = create_oversampled_dataloader(train_dataset, train_labels, batch_size=64, positive_ratio=POSITIVE_RATIO, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)
 
         model = ConvNeXtV2_1D_ECG().to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
-        weight = torch.tensor([1.0, (1-POSITIVE_RATIO)/POSITIVE_RATIO])  # 
+        weight = torch.tensor([1.0, (1-POSITIVE_RATIO)/POSITIVE_RATIO]) 
 
         best_val_loss = float('inf')
-
-        #torch.autograd.set_detect_anomaly(True)
 
         # training loop
         for epoch in range(EPOCHS): 
@@ -243,7 +223,7 @@ def train_model(data_folder, model_folder, verbose):
                     y.to(device),         # int64 tensor, shape (batch,)
                     smooth_flag.to(device), # bool tensor, shape (batch,)
                     weight,          # tensor([w_neg, w_pos])
-                    smoothing=0.1,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
+                    smoothing=0.02,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
                     gamma=2.0, # focusing parameter for focal loss
                 ) 
 
@@ -251,7 +231,6 @@ def train_model(data_folder, model_folder, verbose):
 
                 # Gradient clipping
                 total_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                #print(total_norm_before)
 
                 optimizer.step()
 
@@ -269,14 +248,14 @@ def train_model(data_folder, model_folder, verbose):
                 for X, y, smooth_flag in val_loader:
                     outputs = model(X.to(device))
                     outputs = torch.clamp(outputs, min=-20, max=20)
-                    # TPR@5% loss for validation:
+                    
                     loss = custom_focal_loss(
                         outputs,         # logits from model, shape (batch, 2)
                         y.to(device),         # int64 tensor, shape (batch,)
                         smooth_flag.to(device), # bool tensor, shape (batch,)
                         weight,          # tensor([w_neg, w_pos])
-                        smoothing=0.1,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
-                        gamma=2.0, # focusing parameter for focal loss, not used for validation
+                        smoothing=0.02,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
+                        gamma=2.0, # focusing parameter for focal loss
                     )
                     val_loss += loss.item() * X.size(0)
                     probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas
@@ -286,30 +265,12 @@ def train_model(data_folder, model_folder, verbose):
 
             scheduler.step(avg_val_loss)
 
-            #f1 = compute_f_measure(val_labels, (np.array(val_outputs) > THRESHOLD_PROBABILITY).astype(int))
-            #best_threshold, best_f1 = compute_f1_and_thres(val_labels, np.array(val_outputs))
-            #challenge_score = compute_challenge_score(np.array(val_labels), np.array(val_outputs))
-            #auroc, auprc = compute_auc(np.array(val_labels), np.array(val_outputs))
-
             gc.collect()  # free memory after each epoch
-
-            #if verbose:
-            #    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            #    print(f"Fold {fold}, Epoch {epoch + 1}: "
-            #        f"Train Loss = {avg_train_loss:.3f}, "
-            #        f"Val Loss = {avg_val_loss:.3f}, "
-                    #f"F1_0p5 = {f1:.3f}, "
-            #        f"F1_Best = {best_f1:.3f}, "
-            #        f"Thres_Best = {best_threshold:.3f}, "
-            #        f"AUROC = {auroc:.3f}, "
-            #        f"AUPRC = {auprc:.3f}, "
-            #        f"Challenge Score = {challenge_score:.3f}, "
-            #        f"LR = {optimizer.param_groups[0]['lr']:.2e}")
                 
             if avg_val_loss <= best_val_loss:
                 best_val_loss = avg_val_loss
                 best_model_state = model.state_dict()
-                #torch.save({'model_state_dict': best_model_state}, os.path.join(model_folder, f'model_{fold}.pt')) 
+                torch.save({'model_state_dict': best_model_state}, os.path.join(model_folder, f'model_{fold}.pt')) 
 
         if best_val_loss <= best_val_loss_overall:
             best_val_loss_overall = best_val_loss
@@ -366,8 +327,7 @@ def extract_ECG(record, augment=False):
         signal = random_crop(signal, target_length=ECG_len)
 
 	# [0.05, 150] seems to give better challenge score than [0.5, 47]
-    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.05, 150], augment=augment, target_length=ECG_len)  
-    #assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
+    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[1, 47], augment=augment, target_length=ECG_len)  
 
     return torch.tensor(signal.copy(), dtype=torch.float32)
 
@@ -399,7 +359,7 @@ def remove_powerline_filter(powerline_freq=60, sample_rate=400): # 60 Hz for US,
 
 def bandpass_filter(bandwidth=[0.05, 150], sample_rate=400):
     # --- Bandpass filtering with Butterworth bandpass filter (zero-phase) ---
-    # 4th order Butterworth, passband:
+    # 4th order Butterworth, passband is specified by bandwidth in Hz [low, high]
     nyquist = 0.5 * sample_rate
     low = bandwidth[0] / nyquist
     high = bandwidth[1] / nyquist
