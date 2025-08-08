@@ -327,7 +327,7 @@ def extract_ECG(record, augment=False):
         signal = random_crop(signal, target_length=ECG_len)
 
 	# [0.05, 150] seems to give better challenge score than [0.5, 47]
-    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[1, 47], augment=augment, target_length=ECG_len)  
+    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.05, 150], augment=augment, target_length=ECG_len)  
 
     return torch.tensor(signal.copy(), dtype=torch.float32)
 
