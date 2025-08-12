@@ -269,7 +269,7 @@ def train_model(data_folder, model_folder, verbose):
                     pos_scores = p[pos].unsqueeze(1)
                     margin = 0.05
                     rank_loss = (margin + top_neg.unsqueeze(0) - pos_scores).clamp_min(0).mean()
-                    loss = loss + 0.2 * rank_loss  # 0.2 is a hyperparameter for ranking loss weight
+                    loss = loss + 0.2 * rank_loss  # 0.2 is a hyperparameter for pair-wise ranking loss weight
 
                 loss.backward()
 
