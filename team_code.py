@@ -14,6 +14,8 @@ from scipy.signal import resample_poly  # for resampling ECG signals to 400Hz
 from math import gcd
 import scipy.signal as sgn
 import pywt # wavelet filter for baseline removal
+#import matplotlib.pyplot as plt
+from datetime import datetime
 
 from helper_code import *
 
@@ -26,14 +28,14 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.7 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.60 # above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to get the source of the data in the traiing set: CODE-15%, PTB-XL, or SaMi-Trop
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
 CODE15 = 'CODE-15%' # used to limit CODE-15% data size in the traiing set 
 POSITIVE_RATIO = 0.1 # positive ratio in the training set, used for over sampling positives
 ECG_len = 4096 #  4096 or 5000 or 2934: ?? double-check: all Chagas positives in CODE-15% are 2934 long
-EPOCHS = 10 # number of epochs to train the model
+EPOCHS = 15 # number of epochs to train the model
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels, smoothing_flags, augment=False):
@@ -52,13 +54,16 @@ class ECGDataset(Dataset):
         return signal, label, smooth
 
 # custom Focal loss function with weighted label and label smoothing on CODE-15% data 
-def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, gamma=1.0):
+def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, gamma=1.0, reduction='mean'):
     # outputs: logits (batch, num_classes)
     # targets: class indices (batch,)
     # smoothing_flags: (batch,)
     # weight: (num_classes,) class weights, e.g., torch.tensor([1.0, 19.0])
     # gamma: focusing parameter
     # smoothing: label smoothing value
+
+    #Clamp outputs to avoid NaN/Inf
+    #outputs = torch.clamp(outputs, min=-20, max=20)
 
     num_classes = outputs.shape[1]
     device = outputs.device
@@ -84,10 +89,10 @@ def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, 
     # Class weights (alpha)
     class_weights = weight.to(device).unsqueeze(0)  # (1, num_classes)
 
-    # Combine all terms
-    loss = -(true_dist * focal_term * log_probs * class_weights).sum(dim=1).mean()
+    # Per sample loss - Combine all terms
+    per_sample_loss = -(true_dist * focal_term * log_probs * class_weights).sum(dim=1)
 
-    return loss
+    return per_sample_loss if reduction == 'none' else per_sample_loss.mean()
 
 def compute_f1_and_thres(labels, probs, steps=100):
     """
@@ -122,6 +127,7 @@ def create_oversampled_dataloader(dataset, labels, batch_size=64, positive_ratio
     # Set weights so that sampled positives ≈ positive_ratio
     pos_weight = positive_ratio / (1 - positive_ratio) * n_neg / n_pos 
     neg_weight = 1
+    #print(pos_weight, neg_weight)
     weights = np.where(labels == 1, pos_weight, neg_weight)
     
     sampler = WeightedRandomSampler(weights, len(labels), replacement=True)
@@ -132,7 +138,7 @@ def train_model(data_folder, model_folder, verbose):
         print('Finding the training data...')
 
     # Find the records and add maximum MAX_CODE15 CODE-15% and max MAX_TOTAL total data from the training set 
-    # 1631:90769:10000:102400 SaMi:CODE15%:PTB-XL:Total (1: 15.7: 6.1); 1000:40200:10000:51200; 1000:91400:10000:102400; 1000:193800:10000:204800
+    # 1631:39569:10000:51200; 1631:90769:10000:102400 SaMi:CODE15%:PTB-XL:Total (1: 15.7: 6.1); 1000:40200:10000:51200; 1000:91400:10000:102400; 1000:193800:10000:204800
     MAX_SAMI = 1631 # all positives
     MAX_CODE15 = 39569 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
     MAX_PTBXL = 10000 # all negatives from Europe not from the endemic region South America
@@ -167,6 +173,9 @@ def train_model(data_folder, model_folder, verbose):
                 label_smoothing_flags.append(True) # label smoothing only on CODE-15% data
                 code15_count += 1
             # else: skip, as we've already added maximum CODE-15% records
+        #else:
+        #    records.append(record)
+    #print(sami_count, ptbxl_count, code15_count)
 
     if len(records) == 0:
         raise FileNotFoundError('No useful data were provided.')
@@ -198,15 +207,20 @@ def train_model(data_folder, model_folder, verbose):
 
         train_dataset = ECGDataset(train_records, train_labels, train_smoothing_flags, augment=True)
         val_dataset = ECGDataset(val_records, val_labels, val_smoothing_flags, augment=False)
-        train_loader = create_oversampled_dataloader(train_dataset, train_labels, batch_size=64, positive_ratio=POSITIVE_RATIO, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)
+        #train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=12, pin_memory=True, drop_last=True)
+        train_loader = create_oversampled_dataloader(train_dataset, train_labels, batch_size=64, positive_ratio=POSITIVE_RATIO, num_workers=8)
+        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=8, pin_memory=True, drop_last=True)
 
         model = ConvNeXtV2_1D_ECG().to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
-        weight = torch.tensor([1.0, (1-POSITIVE_RATIO)/POSITIVE_RATIO]) 
+        #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+
+        weight = torch.tensor([1.0, 9.0]) # (1-POSITIVE_RATIO)/POSITIVE_RATIO, or 3-5
 
         best_val_loss = float('inf')
+
+        #torch.autograd.set_detect_anomaly(True)
 
         # training loop
         for epoch in range(EPOCHS): 
@@ -214,23 +228,54 @@ def train_model(data_folder, model_folder, verbose):
             total_loss = 0
             for X, y, smooth_flag in train_loader:
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
+
                 outputs = model(X.to(device)).contiguous()  # logits from model, shape (batch, 2)
                 outputs = torch.clamp(outputs, min=-20, max=20)
 
-                loss = custom_focal_loss(
+                y, smooth_flag = y.to(outputs.device), smooth_flag.to(outputs.device)
+
+                per_sample_loss = custom_focal_loss(
                     outputs,         # logits from model, shape (batch, 2)
-                    y.to(device),         # int64 tensor, shape (batch,)
-                    smooth_flag.to(device), # bool tensor, shape (batch,)
+                    y,         # int64 tensor, shape (batch,)
+                    smooth_flag, # bool tensor, shape (batch,)
                     weight,          # tensor([w_neg, w_pos])
                     smoothing=0.02,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
                     gamma=2.0, # focusing parameter for focal loss
+                    reduction='none' # per-sample loss, shape (batch, )
                 ) 
+
+                # Down-weight hard negatives: class 0 with high predicted prob for class 1 (>0.8)
+                with torch.no_grad():
+                    p_pos = torch.softmax(outputs, dim=1)[:, 1]     # [B]
+                    hard_neg = ((y == 0) & (p_pos > 0.8))   # bool mask
+                    #print(hard_neg.sum().item(), 'hard negatives in batch') # only 0 or 1 hard negatives in each batch
+                    scale = torch.ones_like(p_pos) # on device
+                    scale[hard_neg] = 0.01 # down-weight hard negatives by 0.2, or 0.1, or 0.05, or 0.01
+
+                # Final loss: weighted mean
+                loss = (per_sample_loss * scale).mean()
+
+                # ----  Pairwise Ranking Loss  ----
+                p = torch.softmax(outputs, dim=1)[:, 1]
+                pos = (y == 1)
+                neg = (y == 0)
+
+                if pos.any() and neg.any():
+                    q = 0.2 # fraction of negatives to sample for ranking loss
+                    neg_scores = p[neg]
+                    k = max(1, int(q * neg_scores.numel()))
+                    top_neg, _ = neg_scores.topk(k)
+                    pos_scores = p[pos].unsqueeze(1)
+                    margin = 0.05
+                    rank_loss = (margin + top_neg.unsqueeze(0) - pos_scores).clamp_min(0).mean()
+                    loss = loss + 0.2 * rank_loss  # 0.2 is a hyperparameter for ranking loss weight
 
                 loss.backward()
 
                 # Gradient clipping
                 total_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                #print(total_norm_before)
 
                 optimizer.step()
 
@@ -263,9 +308,28 @@ def train_model(data_folder, model_folder, verbose):
                     val_targets.extend(y.cpu().numpy().tolist())
             avg_val_loss = val_loss / len(val_loader.dataset)
 
-            scheduler.step(avg_val_loss)
+            #scheduler.step(avg_val_loss)
+            scheduler.step()  # cosine step once per epoch
+
+            #f1 = compute_f_measure(val_labels, (np.array(val_outputs) > THRESHOLD_PROBABILITY).astype(int))
+            best_threshold, best_f1 = compute_f1_and_thres(val_labels, np.array(val_outputs))
+            challenge_score = compute_challenge_score(np.array(val_labels), np.array(val_outputs))
+            auroc, auprc = compute_auc(np.array(val_labels), np.array(val_outputs))
 
             gc.collect()  # free memory after each epoch
+
+            if verbose:
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Fold {fold}, Epoch {epoch + 1}: "
+                    f"Train Loss = {avg_train_loss:.3f}, "
+                    f"Val Loss = {avg_val_loss:.3f}, "
+                    #f"F1_0p5 = {f1:.3f}, "
+                    f"F1_Best = {best_f1:.3f}, "
+                    f"Thres_Best = {best_threshold:.3f}, "
+                    f"AUROC = {auroc:.3f}, "
+                    f"AUPRC = {auprc:.3f}, "
+                    f"Challenge Score = {challenge_score:.3f}, "
+                    f"LR = {optimizer.param_groups[0]['lr']:.2e}")
                 
             if avg_val_loss <= best_val_loss:
                 best_val_loss = avg_val_loss
@@ -327,7 +391,8 @@ def extract_ECG(record, augment=False):
         signal = random_crop(signal, target_length=ECG_len)
 
 	# [0.05, 150] seems to give better challenge score than [0.5, 47]
-    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.05, 150], augment=augment, target_length=ECG_len)  
+    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.5, 59], augment=augment, target_length=ECG_len)  
+    #assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
 
     return torch.tensor(signal.copy(), dtype=torch.float32)
 
@@ -513,12 +578,22 @@ def drop_path(x, drop_prob=0.0, training=False):
         nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
         return self.gamma * (x * nx) + self.beta + x """
     
+def Norm1d(C, groups=16):
+    g = min(groups, C)                 # cap groups by channels
+    while C % g != 0 and g > 1:        # ensure divisibility
+        g //= 2
+    if g == 1:
+        # fallback if channels are tiny → InstanceNorm-like behavior
+        return nn.GroupNorm(num_groups=1, num_channels=C, eps=1e-6, affine=True)
+    return nn.GroupNorm(num_groups=g, num_channels=C, eps=1e-6, affine=True)
+
 # 1D ConvNeXt V2 basic block
 class ConvNeXtV2Block1D(nn.Module):
     def __init__(self, dim, drop_prob=0.0):
         super().__init__()
         self.dwconv = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)  # padding=(kernel_size-1)//2, depthwise conv, no need to use large kernel_size
         #self.norm = nn.LayerNorm(dim, eps=1e-6)
+        #self.norm = Norm1d(dim)
         self.norm = nn.BatchNorm1d(dim)
         # self.pwconv1 = nn.Linear(dim, 4 * dim) # inverted bottleneck: 1x1 conv
         self.pwconv1 = nn.Conv1d(dim, 4 * dim, kernel_size=1)
@@ -546,6 +621,7 @@ class Downsample1D(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         #self.norm = nn.LayerNorm(in_channels, eps=1e-6)
+        #self.norm = Norm1d(in_channels)
         self.norm = nn.BatchNorm1d(in_channels, eps=1e-6)
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=2, stride=2)
         
@@ -562,7 +638,9 @@ class Stem1D(nn.Module):
         super().__init__()
         self.conv = nn.Conv1d(input_channels, out_channels, kernel_size=kernel_size, stride=kernel_size)
         #self.norm = nn.LayerNorm(out_channels, eps=1e-6)
+        #self.norm = Norm1d(out_channels)
         self.norm = nn.BatchNorm1d(out_channels)
+        
     
     def forward(self, x):
         x = self.conv(x)             # [B, C, L]
@@ -570,7 +648,7 @@ class Stem1D(nn.Module):
         x = self.norm(x)             # [B, L, C]
         #x = x.transpose(1, 2)        # [B, C, L]
         return x
-    
+
 # 1D ConvNeXtV2 model: ~23 million parameters for [64, 128, 256, 512], [3, 3, 9, 3]; ~ 2.37 million parameters for [32, 64, 128, 256]
 class ConvNeXtV2_1D_ECG(nn.Module):
     def __init__(self, input_channels=12, num_classes=2):
@@ -596,15 +674,16 @@ class ConvNeXtV2_1D_ECG(nn.Module):
                 self.blocks.append(Downsample1D(dims[i], dims[i + 1]))
 
         #self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
+        #self.norm = Norm1d(dims[-1])
         self.norm = nn.BatchNorm1d(dims[-1])
         self.pool = nn.AdaptiveAvgPool1d(1)
 
         self.dropout = nn.Dropout(0.3)
         self.head = nn.Sequential(
-            nn.Linear(dims[-1], 256),
+            nn.Linear(dims[-1], 512),
             nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
+            nn.Linear(512, num_classes)
         )
 
         # Initialize weights
