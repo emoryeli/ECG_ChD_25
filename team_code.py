@@ -15,7 +15,7 @@ from math import gcd
 import scipy.signal as sgn
 import pywt # wavelet filter for baseline removal
 #import matplotlib.pyplot as plt
-from datetime import datetime
+#from datetime import datetime
 
 from helper_code import *
 
@@ -28,14 +28,14 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.60 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.71 # above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to get the source of the data in the traiing set: CODE-15%, PTB-XL, or SaMi-Trop
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
 CODE15 = 'CODE-15%' # used to limit CODE-15% data size in the traiing set 
 POSITIVE_RATIO = 0.1 # positive ratio in the training set, used for over sampling positives
 ECG_len = 4096 #  4096 or 5000 or 2934: ?? double-check: all Chagas positives in CODE-15% are 2934 long
-EPOCHS = 12 # number of epochs to train the model
+EPOCHS = 10 # number of epochs to train the model
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels, smoothing_flags, augment=False):
@@ -54,7 +54,7 @@ class ECGDataset(Dataset):
         return signal, label, smooth
 
 # custom Focal loss function with weighted label and label smoothing on CODE-15% data 
-def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, gamma=1.0, reduction='mean'):
+def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.02, gamma=2.0, reduction='mean'):
     # outputs: logits (batch, num_classes)
     # targets: class indices (batch,)
     # smoothing_flags: (batch,)
@@ -189,7 +189,8 @@ def train_model(data_folder, model_folder, verbose):
     label_smoothing_flags = np.array(label_smoothing_flags)
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    best_val_loss_overall = float('inf')
+    #best_val_loss_overall = float('inf')
+    best_challenge_score_overall = -1.0
     best_model_state_overall = None
 
     os.makedirs(model_folder, exist_ok=True) # save the best model for each fold as model_{fold}.pt, and the best model overall as model.pt
@@ -218,7 +219,8 @@ def train_model(data_folder, model_folder, verbose):
 
         weight = torch.tensor([1.0, 9.0]) # (1-POSITIVE_RATIO)/POSITIVE_RATIO, or 3-5
 
-        best_val_loss = float('inf')
+        #best_val_loss = float('inf')
+        best_challenge_score = -1.0
 
         #torch.autograd.set_detect_anomaly(True)
 
@@ -231,7 +233,7 @@ def train_model(data_folder, model_folder, verbose):
                 optimizer.zero_grad(set_to_none=True)
 
                 outputs = model(X.to(device)).contiguous()  # logits from model, shape (batch, 2)
-                outputs = torch.clamp(outputs, min=-20, max=20)
+                #outputs = torch.clamp(outputs, min=-20, max=20)
 
                 y, smooth_flag = y.to(outputs.device), smooth_flag.to(outputs.device)
 
@@ -245,31 +247,51 @@ def train_model(data_folder, model_folder, verbose):
                     reduction='none' # per-sample loss, shape (batch, )
                 ) 
 
-                # Down-weight hard negatives: class 0 with high predicted prob for class 1 (>0.8)
+                """ # Down-weight code 15% hard negatives: class 0 in code 15% with high predicted prob for class 1 (>0.8)
                 with torch.no_grad():
                     p_pos = torch.softmax(outputs, dim=1)[:, 1]     # [B]
-                    hard_neg = ((y == 0) & (p_pos > 0.8))   # bool mask
-                    #print(hard_neg.sum().item(), 'hard negatives in batch') # only 0 or 1 hard negatives in each batch
+                    code_neg = (y == 0) & smooth_flag # bool mask for CODE-15% negatives
+                    hard_neg = (code_neg & (p_pos > 0.8))   # bool mask
+                    #print(hard_neg.sum().item(), 'code 15% hard negatives in batch') # only 0 or 1 hard negatives in each batch
                     scale = torch.ones_like(p_pos) # on device
-                    scale[hard_neg] = 0.01 # down-weight hard negatives by 0.2, or 0.1, or 0.05, or 0.01
+                    scale[hard_neg] = 1.0 # down-weight hard negatives by 0.2, or 0.1, or 0.05, or 0.01
+                    #frac = hard_neg.sum().item() / code_neg.sum().item() if code_neg.any() else 0.0
+                    #print(f"Down-wt CODE 15% hard negs: {100*frac:.1f}%")
 
                 # Final loss: weighted mean
-                loss = (per_sample_loss * scale).mean()
+                loss = (per_sample_loss * scale).mean() """
+                loss = per_sample_loss.mean()
 
-                # ----  Pairwise Ranking Loss  ----
-                p = torch.softmax(outputs, dim=1)[:, 1]
+                # Pairwise Ranking Loss
+                # using logits:
+                logits = outputs[:, 1] - outputs[:, 0]
+                # using probabilities:
+                #p = torch.softmax(outputs, dim=1)[:, 1]
                 pos = (y == 1)
-                neg = (y == 0)
+                neg = (y == 0) 
 
                 if pos.any() and neg.any():
+                    # using logits:
+                    pos_scores = logits[pos].unsqueeze(1)
+                    neg_scores = logits[neg]
+                    # using probabilities:
+                    #pos_scores = p[pos].unsqueeze(1)
+                    #neg_scores = p[neg]
+
                     q = 0.2 # fraction of negatives to sample for ranking loss
-                    neg_scores = p[neg]
                     k = max(1, int(q * neg_scores.numel()))
                     top_neg, _ = neg_scores.topk(k)
-                    pos_scores = p[pos].unsqueeze(1)
-                    margin = 0.05
+                    
+                    margin = 1.0 # logit margin, try 0.3-1.0
+                    #margin = 0.05 # probability margin
                     rank_loss = (margin + top_neg.unsqueeze(0) - pos_scores).clamp_min(0).mean()
-                    loss = loss + 0.2 * rank_loss  # 0.2 is a hyperparameter for pair-wise ranking loss weight
+                    # ramp the weight so it matters after the EMA peak
+                    #w0, w1 = 0.2, 0.2  # start small, end modest 0.05, 0.2
+                    #t = epoch / max(EPOCHS-1, 1)
+                    #rank_w = w0 + (w1 - w0) * t
+                    #print(f"Rank Loss: {0.rank_w*rank_loss.item():.4f}, Loss: {loss.item():.4f}")
+                    rank_w = 0.2
+                    loss = loss + rank_w * rank_loss
 
                 loss.backward()
 
@@ -289,10 +311,10 @@ def train_model(data_folder, model_folder, verbose):
             val_targets = [] #labels, 0 or 1
             
             # validation loop
-            with torch.no_grad():
+            with torch.inference_mode():
                 for X, y, smooth_flag in val_loader:
                     outputs = model(X.to(device))
-                    outputs = torch.clamp(outputs, min=-20, max=20)
+                    #outputs = torch.clamp(outputs, min=-20, max=20)
                     
                     loss = custom_focal_loss(
                         outputs,         # logits from model, shape (batch, 2)
@@ -316,9 +338,14 @@ def train_model(data_folder, model_folder, verbose):
             challenge_score = compute_challenge_score(np.array(val_labels), np.array(val_outputs))
             auroc, auprc = compute_auc(np.array(val_labels), np.array(val_outputs))
 
+            # top-5% cutoff prob (to see if inflation is happening)
+            #K = int(0.05 * len(val_outputs))
+            #cutoff = np.sort(val_outputs)[-K]
+            #print(f"Top-5% cutoff: {cutoff:.3f}")
+
             gc.collect()  # free memory after each epoch
 
-            if verbose:
+            """if verbose:
                 print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"Fold {fold}, Epoch {epoch + 1}: "
                     f"Train Loss = {avg_train_loss:.3f}, "
@@ -329,24 +356,29 @@ def train_model(data_folder, model_folder, verbose):
                     f"AUROC = {auroc:.3f}, "
                     f"AUPRC = {auprc:.3f}, "
                     f"Challenge Score = {challenge_score:.3f}, "
-                    f"LR = {optimizer.param_groups[0]['lr']:.2e}")
+                    f"LR = {optimizer.param_groups[0]['lr']:.2e}") """
                 
-            if avg_val_loss <= best_val_loss:
-                best_val_loss = avg_val_loss
+            #if avg_val_loss <= best_val_loss:
+            #    best_val_loss = avg_val_loss
+            if challenge_score >= best_challenge_score:
+                best_challenge_score = challenge_score
                 best_model_state = model.state_dict()
                 torch.save({'model_state_dict': best_model_state}, os.path.join(model_folder, f'model_{fold}.pt')) 
 
-        if best_val_loss <= best_val_loss_overall:
-            best_val_loss_overall = best_val_loss
+        #if best_val_loss <= best_val_loss_overall:
+        #    best_val_loss_overall = best_val_loss
+        if best_challenge_score >= best_challenge_score_overall:
+            best_challenge_score_overall = best_challenge_score
             best_model_state_overall = best_model_state
 
     torch.save({'model_state_dict': best_model_state_overall}, os.path.join(model_folder, 'model.pt'))
+    #try saving ensemble model
 
 def save_model(model_folder, model):
     os.makedirs(model_folder, exist_ok=True)
     torch.save({'model_state_dict': model.state_dict()}, os.path.join(model_folder, 'model.pt'))
 
-def load_model(model_folder, verbose):
+""" def load_model(model_folder, verbose):
     model = ConvNeXtV2_1D_ECG()
     checkpoint = torch.load(os.path.join(model_folder, 'model.pt'), map_location=torch.device('cpu'))
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -358,7 +390,37 @@ def run_model(record, model, verbose):
     output = model(x)
     probs = torch.softmax(output, dim=1).detach().numpy()[0]
     binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # 1 for Chagas disease, 0 for no Chagas diseas
+    return binary_output, probs[1] """
+
+# load 5 models from the model_folder
+def load_model(model_folder, verbose):
+    model_paths = [os.path.join(model_folder, f"model_{i}.pt") for i in range(1, 6)]
+    ckpts = [p for p in model_paths if os.path.isfile(p)]
+    if len(ckpts) == 0: 
+        print(f"No models found in {model_folder}.")
+        return None
+    else: 
+        models = [load_individual_model(p) for p in ckpts]
+        return models
+
+def run_model(record, model, verbose): # model is a list of 5 models
+    x = extract_ECG(record, augment=False).unsqueeze(0)
+    output_logits = ensemble_logits(x, model)
+    probs = torch.softmax(output_logits, dim=1).detach().numpy()[0]
+    binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # 1 for Chagas disease, 0 for no Chagas diseas
     return binary_output, probs[1]
+
+def load_individual_model(path):
+    model = ConvNeXtV2_1D_ECG()
+    checkpoint = torch.load(path, map_location=torch.device('cpu'))
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    model.eval()
+    return model
+
+@torch.no_grad()
+def ensemble_logits(x, models):
+    # average logits is better than averaging probs
+    return sum(m(x) for m in models) / len(models)
 
 def extract_ECG(record, augment=False):
     # Load signal as (samples, leads), and header as text string
@@ -388,9 +450,9 @@ def extract_ECG(record, augment=False):
         pad_width = ECG_len - signal.shape[1]
         signal = np.pad(signal, ((0, 0), (0, pad_width)), mode='edge')
     else: # random cropping for data augmentation
-        signal = random_crop(signal, target_length=ECG_len)
+        signal = random_crop(signal, target_length=ECG_len) if augment else signal[:, :ECG_len] 
 
-	# [0.05, 150] seems to give better challenge score than [0.5, 47]
+	# [0.05, 150] gave worse challenge score than [1, 47]
     signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.5, 59], augment=augment, target_length=ECG_len)  
     #assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
 
@@ -484,7 +546,7 @@ def add_baseline_wander(signal, sample_rate=400, max_ampl=0.1, freq_range=(0.15,
     drift = amp * np.sin(2 * np.pi * freq * t + phase)
     return signal + drift
 
-def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=[0.05, 150], augment=False, target_length=ECG_len):
+def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=[1, 47], augment=False, target_length=ECG_len):
     # signal shape: (samples,) or (channels, samples)
     x = signal
 
