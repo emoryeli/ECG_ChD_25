@@ -14,6 +14,7 @@ from scipy.signal import resample_poly  # for resampling ECG signals to 400Hz
 from math import gcd
 import scipy.signal as sgn
 import pywt # wavelet filter for baseline removal
+import copy
 #import matplotlib.pyplot as plt
 #from datetime import datetime
 
@@ -28,13 +29,13 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.71 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.8 # above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to get the source of the data in the traiing set: CODE-15%, PTB-XL, or SaMi-Trop
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
 CODE15 = 'CODE-15%' # used to limit CODE-15% data size in the traiing set 
 POSITIVE_RATIO = 0.1 # positive ratio in the training set, used for over sampling positives
-ECG_len = 4096 #  4096 or 5000 or 2934: ?? double-check: all Chagas positives in CODE-15% are 2934 long
+ECG_len = 4096 #  4096 or 5000 or 2934: double-check: all Chagas positives in CODE-15% are 2934 long
 EPOCHS = 10 # number of epochs to train the model
 
 class ECGDataset(Dataset):
@@ -54,7 +55,7 @@ class ECGDataset(Dataset):
         return signal, label, smooth
 
 # custom Focal loss function with weighted label and label smoothing on CODE-15% data 
-def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.02, gamma=2.0, reduction='mean'):
+def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, gamma=1.0, reduction='mean'):
     # outputs: logits (batch, num_classes)
     # targets: class indices (batch,)
     # smoothing_flags: (batch,)
@@ -133,12 +134,43 @@ def create_oversampled_dataloader(dataset, labels, batch_size=64, positive_ratio
     sampler = WeightedRandomSampler(weights, len(labels), replacement=True)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, drop_last=True)
 
+class ModelEMA:
+    def __init__(self, model, decay=0.999, device=None):
+        self.decay = decay
+        self.ema = copy.deepcopy(model).eval()
+        if device is not None:
+            self.ema.to(device)
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        d = self.decay
+        """msd = model.state_dict()
+        esd = self.ema.state_dict()
+        for k in esd.keys():
+            v = msd[k]
+            if esd[k].dtype.is_floating_point:
+                esd[k].mul_(d).add_(v, alpha=1 - d)  # smooth float tensors
+            else:
+                esd[k].copy_(v)  # copy ints (e.g., num_batches_tracked)"""
+        d_bn = 0.9 # for BatchNorm buffers, use a smaller decay; d_bn = 0 is simple copy
+        msd = model.state_dict()
+        esd = self.ema.state_dict()
+        for k, v in msd.items():
+            if not esd[k].dtype.is_floating_point:
+                esd[k].copy_(v)  # copy ints (e.g., num_batches_tracked)
+            # For BatchNorm buffers EMA-averaging, use a smaller decay d_bn 
+            elif k.endswith('running_mean') or k.endswith('running_var'):
+                esd[k].mul_(d_bn).add_(v, alpha=1 - d_bn)
+            else:
+                esd[k].mul_(d).add_(v, alpha=1 - d)
+
 def train_model(data_folder, model_folder, verbose):
     if verbose:
         print('Finding the training data...')
 
-    # Find the records and add maximum MAX_CODE15 CODE-15% and max MAX_TOTAL total data from the training set 
-    # 1631:39569:10000:51200; 1631:90769:10000:102400 SaMi:CODE15%:PTB-XL:Total (1: 15.7: 6.1); 1000:40200:10000:51200; 1000:91400:10000:102400; 1000:193800:10000:204800
+    # Find the records SaMi:CODE15%:PTB-XL:Total:
     MAX_SAMI = 1631 # all positives
     MAX_CODE15 = 28569 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
     MAX_PTBXL = 21000 # all negatives from Europe not from the endemic region South America
@@ -213,11 +245,13 @@ def train_model(data_folder, model_folder, verbose):
         val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=8, pin_memory=True, drop_last=True)
 
         model = ConvNeXtV2_1D_ECG().to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
+        ema = ModelEMA(model, decay=0.999, device=device)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1.5e-3)
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
-        weight = torch.tensor([1.0, 9.0]) # (1-POSITIVE_RATIO)/POSITIVE_RATIO, or 3-5
+        weight = torch.tensor([1.0, 12.0]) # (1-POSITIVE_RATIO)/POSITIVE_RATIO, or 3-5
 
         #best_val_loss = float('inf')
         best_challenge_score = -1.0
@@ -228,7 +262,7 @@ def train_model(data_folder, model_folder, verbose):
         for epoch in range(EPOCHS): 
             model.train()
             total_loss = 0
-            for X, y, smooth_flag in train_loader:
+            for X, y, smooth_flag in train_loader: # 51200/5/64 = 160 iterations per epoch
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -239,7 +273,7 @@ def train_model(data_folder, model_folder, verbose):
 
                 per_sample_loss = custom_focal_loss(
                     outputs,         # logits from model, shape (batch, 2)
-                    y,         # int64 tensor, shape (batch,)
+                    y,         # labels, int64 tensor, shape (batch,)
                     smooth_flag, # bool tensor, shape (batch,)
                     weight,          # tensor([w_neg, w_pos])
                     smoothing=0.02,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
@@ -247,19 +281,17 @@ def train_model(data_folder, model_folder, verbose):
                     reduction='none' # per-sample loss, shape (batch, )
                 ) 
 
-                """ # Down-weight code 15% hard negatives: class 0 in code 15% with high predicted prob for class 1 (>0.8)
-                with torch.no_grad():
+                # Down-weight hard negatives: class 0 with high predicted prob for class 1 (>0.8) (potential mislabels)
+                """with torch.no_grad():
                     p_pos = torch.softmax(outputs, dim=1)[:, 1]     # [B]
                     code_neg = (y == 0) & smooth_flag # bool mask for CODE-15% negatives
-                    hard_neg = (code_neg & (p_pos > 0.8))   # bool mask
-                    #print(hard_neg.sum().item(), 'code 15% hard negatives in batch') # only 0 or 1 hard negatives in each batch
+                    hard_neg = (code_neg & (p_pos > 0.8))   # bool mask for hard negatives among CODE-15% negatives (potential mislabels)
+                    #print(hard_neg.sum().item(), 'hard negatives in batch') # only 0 or 1 hard negatives in each batch (ok as mislabels should be less than 4%)
                     scale = torch.ones_like(p_pos) # on device
-                    scale[hard_neg] = 1.0 # down-weight hard negatives by 0.2, or 0.1, or 0.05, or 0.01
-                    #frac = hard_neg.sum().item() / code_neg.sum().item() if code_neg.any() else 0.0
-                    #print(f"Down-wt CODE 15% hard negs: {100*frac:.1f}%")
+                    scale[hard_neg] = 0.01 # down-weight hard negatives by 0.2, or 0.1, or 0.05, or 0.01
 
                 # Final loss: weighted mean
-                loss = (per_sample_loss * scale).mean() """
+                loss = (per_sample_loss * scale).mean()"""
                 loss = per_sample_loss.mean()
 
                 # Pairwise Ranking Loss
@@ -286,11 +318,11 @@ def train_model(data_folder, model_folder, verbose):
                     #margin = 0.05 # probability margin
                     rank_loss = (margin + top_neg.unsqueeze(0) - pos_scores).clamp_min(0).mean()
                     # ramp the weight so it matters after the EMA peak
-                    #w0, w1 = 0.2, 0.2  # start small, end modest 0.05, 0.2
+                    #w0, w1 = 0.2, 0.2  # start small, end modest 0.05, 0.3
                     #t = epoch / max(EPOCHS-1, 1)
                     #rank_w = w0 + (w1 - w0) * t
-                    #print(f"Rank Loss: {0.rank_w*rank_loss.item():.4f}, Loss: {loss.item():.4f}")
                     rank_w = 0.2
+                    #print(f"Rank Loss: {rank_loss.item():.4f}, Loss: {loss.item():.4f}")        
                     loss = loss + rank_w * rank_loss
 
                 loss.backward()
@@ -300,12 +332,15 @@ def train_model(data_folder, model_folder, verbose):
                 #print(total_norm_before)
 
                 optimizer.step()
+                ema.update(model)  # update EMA model
 
                 total_loss += loss.item() * X.size(0)
 
             avg_train_loss = total_loss / len(train_loader.dataset)
 
             model.eval()
+            ema.ema.eval()
+
             val_loss = 0
             val_outputs = [] #predicted probabilities, float64
             val_targets = [] #labels, 0 or 1
@@ -313,7 +348,8 @@ def train_model(data_folder, model_folder, verbose):
             # validation loop
             with torch.inference_mode():
                 for X, y, smooth_flag in val_loader:
-                    outputs = model(X.to(device))
+                    outputs = ema.ema(X.to(device))  # logits from EMA model, shape (batch, 2)
+                    #outputs = model(X.to(device))
                     #outputs = torch.clamp(outputs, min=-20, max=20)
                     
                     loss = custom_focal_loss(
@@ -333,24 +369,19 @@ def train_model(data_folder, model_folder, verbose):
             #scheduler.step(avg_val_loss)
             scheduler.step()  # cosine step once per epoch
 
-            #f1 = compute_f_measure(val_labels, (np.array(val_outputs) > THRESHOLD_PROBABILITY).astype(int))
-            best_threshold, best_f1 = compute_f1_and_thres(val_labels, np.array(val_outputs))
-            challenge_score = compute_challenge_score(np.array(val_labels), np.array(val_outputs))
-            auroc, auprc = compute_auc(np.array(val_labels), np.array(val_outputs))
-
-            # top-5% cutoff prob (to see if inflation is happening)
-            #K = int(0.05 * len(val_outputs))
-            #cutoff = np.sort(val_outputs)[-K]
-            #print(f"Top-5% cutoff: {cutoff:.3f}")
+            val_outputs_np = np.array(val_outputs)
+            val_labels_np = np.array(val_targets)
+            best_threshold, best_f1 = compute_f1_and_thres(val_labels_np, val_outputs_np)
+            challenge_score = compute_challenge_score(val_labels_np, val_outputs_np)
+            auroc, auprc = compute_auc(val_labels_np, val_outputs_np)
 
             gc.collect()  # free memory after each epoch
 
-            """if verbose:
+            """ if verbose:
                 print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"Fold {fold}, Epoch {epoch + 1}: "
                     f"Train Loss = {avg_train_loss:.3f}, "
                     f"Val Loss = {avg_val_loss:.3f}, "
-                    #f"F1_0p5 = {f1:.3f}, "
                     f"F1_Best = {best_f1:.3f}, "
                     f"Thres_Best = {best_threshold:.3f}, "
                     f"AUROC = {auroc:.3f}, "
@@ -362,7 +393,8 @@ def train_model(data_folder, model_folder, verbose):
             #    best_val_loss = avg_val_loss
             if challenge_score >= best_challenge_score:
                 best_challenge_score = challenge_score
-                best_model_state = model.state_dict()
+                #best_model_state = model.state_dict()
+                best_model_state = copy.deepcopy(ema.ema.state_dict())
                 torch.save({'model_state_dict': best_model_state}, os.path.join(model_folder, f'model_{fold}.pt')) 
 
         #if best_val_loss <= best_val_loss_overall:
@@ -372,13 +404,12 @@ def train_model(data_folder, model_folder, verbose):
             best_model_state_overall = best_model_state
 
     torch.save({'model_state_dict': best_model_state_overall}, os.path.join(model_folder, 'model.pt'))
-    #try saving ensemble model
 
 def save_model(model_folder, model):
     os.makedirs(model_folder, exist_ok=True)
     torch.save({'model_state_dict': model.state_dict()}, os.path.join(model_folder, 'model.pt'))
 
-""" def load_model(model_folder, verbose):
+"""def load_model(model_folder, verbose):
     model = ConvNeXtV2_1D_ECG()
     checkpoint = torch.load(os.path.join(model_folder, 'model.pt'), map_location=torch.device('cpu'))
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -393,6 +424,18 @@ def run_model(record, model, verbose):
     return binary_output, probs[1] """
 
 # load 5 models from the model_folder
+def load_individual_model(path):
+    model = ConvNeXtV2_1D_ECG()
+    checkpoint = torch.load(path, map_location=torch.device('cpu'))
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    model.eval()
+    return model
+
+@torch.no_grad()
+def ensemble_logits(x, models):
+    # average logits is better than averaging probs
+    return sum(m(x) for m in models) / len(models)
+
 def load_model(model_folder, verbose):
     model_paths = [os.path.join(model_folder, f"model_{i}.pt") for i in range(1, 6)]
     ckpts = [p for p in model_paths if os.path.isfile(p)]
@@ -409,18 +452,6 @@ def run_model(record, model, verbose): # model is a list of 5 models
     probs = torch.softmax(output_logits, dim=1).detach().numpy()[0]
     binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # 1 for Chagas disease, 0 for no Chagas diseas
     return binary_output, probs[1]
-
-def load_individual_model(path):
-    model = ConvNeXtV2_1D_ECG()
-    checkpoint = torch.load(path, map_location=torch.device('cpu'))
-    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
-    model.eval()
-    return model
-
-@torch.no_grad()
-def ensemble_logits(x, models):
-    # average logits is better than averaging probs
-    return sum(m(x) for m in models) / len(models)
 
 def extract_ECG(record, augment=False):
     # Load signal as (samples, leads), and header as text string
@@ -449,10 +480,10 @@ def extract_ECG(record, augment=False):
     if signal.shape[1] < ECG_len:
         pad_width = ECG_len - signal.shape[1]
         signal = np.pad(signal, ((0, 0), (0, pad_width)), mode='edge')
-    else: # random cropping for data augmentation
+    else: # random cropping if augment = True
         signal = random_crop(signal, target_length=ECG_len) if augment else signal[:, :ECG_len] 
 
-	# [0.05, 150] gave worse challenge score than [1, 47]
+	# [0.05, 150] seems to give better challenge score than [0.5, 47]
     signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.5, 59], augment=augment, target_length=ECG_len)  
     #assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
 
@@ -546,7 +577,7 @@ def add_baseline_wander(signal, sample_rate=400, max_ampl=0.1, freq_range=(0.15,
     drift = amp * np.sin(2 * np.pi * freq * t + phase)
     return signal + drift
 
-def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=[1, 47], augment=False, target_length=ECG_len):
+def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=[0.05, 150], augment=False, target_length=ECG_len):
     # signal shape: (samples,) or (channels, samples)
     x = signal
 
@@ -640,14 +671,14 @@ def drop_path(x, drop_prob=0.0, training=False):
         nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
         return self.gamma * (x * nx) + self.beta + x """
     
-def Norm1d(C, groups=16):
+""" def Norm1d(C, groups=16): # GroupNorm for 1D data, similar to LayerNorm but with groups
     g = min(groups, C)                 # cap groups by channels
     while C % g != 0 and g > 1:        # ensure divisibility
         g //= 2
     if g == 1:
         # fallback if channels are tiny → InstanceNorm-like behavior
         return nn.GroupNorm(num_groups=1, num_channels=C, eps=1e-6, affine=True)
-    return nn.GroupNorm(num_groups=g, num_channels=C, eps=1e-6, affine=True)
+    return nn.GroupNorm(num_groups=g, num_channels=C, eps=1e-6, affine=True) """
 
 # 1D ConvNeXt V2 basic block
 class ConvNeXtV2Block1D(nn.Module):
@@ -703,7 +734,6 @@ class Stem1D(nn.Module):
         #self.norm = Norm1d(out_channels)
         self.norm = nn.BatchNorm1d(out_channels)
         
-    
     def forward(self, x):
         x = self.conv(x)             # [B, C, L]
         #x = x.transpose(1, 2)        # [B, L, C]
@@ -715,8 +745,8 @@ class Stem1D(nn.Module):
 class ConvNeXtV2_1D_ECG(nn.Module):
     def __init__(self, input_channels=12, num_classes=2):
         super().__init__()
-        dims = [64, 128, 256, 512]  # Small dimensions [64, 128, 256, 512], [96, 192, 384, 768] try larger dims like [128, 256, 512, 1024] if data and compute allow
-        stages = [3, 3, 18, 3]      # Small block counts [2, 2, 6, 2], try larger stages like [3, 3, 27, 3] if data and compute allow
+        dims = [96, 192, 384, 768]  # Small dimensions [64, 128, 256, 512], [96, 192, 384, 768] try larger dims like [128, 256, 512, 1024] if data and compute allow
+        stages = [3, 3, 27, 3]      # Small block counts [2, 2, 6, 2], try larger stages like [3, 3, 27, 3] if data and compute allow
         drop_path_rate = 0.1
 
         self.stem = Stem1D(input_channels, dims[0], kernel_size=3)
