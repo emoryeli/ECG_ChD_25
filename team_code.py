@@ -36,7 +36,7 @@ PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
 CODE15 = 'CODE-15%' # used to limit CODE-15% data size in the traiing set 
 POSITIVE_RATIO = 0.1 # positive ratio in the training set, used for over sampling positives
 ECG_len = 4096 #  4096 or 5000 or 2934: double-check: all Chagas positives in CODE-15% are 2934 long
-EPOCHS = 10 # number of epochs to train the model
+EPOCHS = 8 # number of epochs to train the model
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels, smoothing_flags, augment=False):
