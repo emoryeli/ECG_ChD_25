@@ -34,7 +34,7 @@ source_string = '# Source:' # used to get the source of the data in the traiing 
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
 CODE15 = 'CODE-15%' # used to limit CODE-15% data size in the traiing set 
-POSITIVE_RATIO = 0.1 # positive ratio in the training set, used for over sampling positives
+POSITIVE_RATIO = 0.5 # positive ratio in the training set, used for over sampling positives
 ECG_len = 4096 #  4096 or 5000 or 2934: double-check: all Chagas positives in CODE-15% are 2934 long
 EPOCHS = 8 # number of epochs to train the model
 
@@ -118,7 +118,7 @@ def compute_f1_and_thres(labels, probs, steps=100):
     return best_threshold, best_f1
 
 # oversample positives to positive_ratio of overall data (not per epoch)
-def create_oversampled_dataloader(dataset, labels, batch_size=64, positive_ratio=0.1, num_workers=12):
+def create_oversampled_dataloader(dataset, labels, batch_size=64, positive_ratio=0.5, num_workers=12):
     labels = np.array(labels)
     pos = (labels == 1)
     neg = (labels == 0)
