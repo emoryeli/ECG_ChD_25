@@ -16,7 +16,7 @@ import scipy.signal as sgn
 import pywt # wavelet filter for baseline removal
 import copy
 #import matplotlib.pyplot as plt
-#from datetime import datetime
+from datetime import datetime
 
 from helper_code import *
 
@@ -29,14 +29,14 @@ elif device.type == 'mps':
 elif device.type == 'cpu':
     torch.set_num_threads(os.cpu_count())  # or 16
 
-THRESHOLD_PROBABILITY = 0.8 # above this threshold, the model predicts Chagas disease
+THRESHOLD_PROBABILITY = 0.86 # above this threshold, the model predicts Chagas disease
 source_string = '# Source:' # used to get the source of the data in the traiing set: CODE-15%, PTB-XL, or SaMi-Trop
 SAMI = 'SaMi-Trop' # used to limit SaMi data size in the training set
 PTBXL = 'PTB-XL' # used to limit PTB-XL data size in  the training set
 CODE15 = 'CODE-15%' # used to limit CODE-15% data size in the traiing set 
 POSITIVE_RATIO = 0.5 # positive ratio in the training set, used for over sampling positives
 ECG_len = 4096 #  4096 or 5000 or 2934: double-check: all Chagas positives in CODE-15% are 2934 long
-EPOCHS = 8 # number of epochs to train the model
+EPOCHS = 12 # number of epochs to train the model
 
 class ECGDataset(Dataset):
     def __init__(self, records, labels, smoothing_flags, augment=False):
@@ -55,7 +55,7 @@ class ECGDataset(Dataset):
         return signal, label, smooth
 
 # custom Focal loss function with weighted label and label smoothing on CODE-15% data 
-def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, gamma=1.0, reduction='mean'):
+def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.02, gamma=2.0, reduction='mean'):
     # outputs: logits (batch, num_classes)
     # targets: class indices (batch,)
     # smoothing_flags: (batch,)
@@ -85,7 +85,7 @@ def custom_focal_loss(outputs, targets, smoothing_flags, weight, smoothing=0.1, 
     probs = log_probs.exp()                    # (batch, num_classes)
 
     # Focal Loss term: (1 - pt) ** gamma
-    focal_term = (1.0 - probs) ** gamma
+    focal_term = (1.0 - probs) ** gamma # larger gamma focuses more on hard examples
 
     # Class weights (alpha)
     class_weights = weight.to(device).unsqueeze(0)  # (1, num_classes)
@@ -160,7 +160,7 @@ class ModelEMA:
         for k, v in msd.items():
             if not esd[k].dtype.is_floating_point:
                 esd[k].copy_(v)  # copy ints (e.g., num_batches_tracked)
-            # For BatchNorm buffers EMA-averaging, use a smaller decay d_bn 
+            # For BatchNorm buffers EMA, use a smaller decay d_bn 
             elif k.endswith('running_mean') or k.endswith('running_var'):
                 esd[k].mul_(d_bn).add_(v, alpha=1 - d_bn)
             else:
@@ -171,9 +171,11 @@ def train_model(data_folder, model_folder, verbose):
         print('Finding the training data...')
 
     # Find the records SaMi:CODE15%:PTB-XL:Total:
+    # 1631:28569:21000:51200; 
+    # 1000:31200:19000:51200; 
     MAX_SAMI = 1631 # all positives
     MAX_CODE15 = 28569 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
-    MAX_PTBXL = 21000 # all negatives from Europe not from the endemic region South America
+    MAX_PTBXL = 21000 # all negatives from Germany not from the endemic region South America
     MAX_TOTAL = 51200 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
 
     all_records = find_records(data_folder)
@@ -220,7 +222,7 @@ def train_model(data_folder, model_folder, verbose):
     labels = np.array(labels)
     label_smoothing_flags = np.array(label_smoothing_flags)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42) # 12345, 8011
     #best_val_loss_overall = float('inf')
     best_challenge_score_overall = -1.0
     best_model_state_overall = None
@@ -245,13 +247,14 @@ def train_model(data_folder, model_folder, verbose):
         val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=8, pin_memory=True, drop_last=True)
 
         model = ConvNeXtV2_1D_ECG().to(device)
+        # print(f"# of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}" )
         ema = ModelEMA(model, decay=0.999, device=device)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1.5e-3)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=5e-6)
 
-        weight = torch.tensor([1.0, 12.0]) # (1-POSITIVE_RATIO)/POSITIVE_RATIO, or 3-5
+        weight = torch.tensor([1.0, 9.0]) # (1-POSITIVE_RATIO)/POSITIVE_RATIO
 
         #best_val_loss = float('inf')
         best_challenge_score = -1.0
@@ -259,7 +262,7 @@ def train_model(data_folder, model_folder, verbose):
         #torch.autograd.set_detect_anomaly(True)
 
         # training loop
-        for epoch in range(EPOCHS): 
+        for epoch in range(1, EPOCHS+1): 
             model.train()
             total_loss = 0
             for X, y, smooth_flag in train_loader: # 51200/5/64 = 160 iterations per epoch
@@ -281,26 +284,27 @@ def train_model(data_folder, model_folder, verbose):
                     reduction='none' # per-sample loss, shape (batch, )
                 ) 
 
-                # Down-weight hard negatives: class 0 with high predicted prob for class 1 (>0.8) (potential mislabels)
-                """with torch.no_grad():
+                # Down-weight hard negatives: non-chagas(label 0) with high predicted probability for Chagas (p > 0.8) (potential mislabels)
+                # future: try Huber loss?
+                with torch.no_grad():
                     p_pos = torch.softmax(outputs, dim=1)[:, 1]     # [B]
                     code_neg = (y == 0) & smooth_flag # bool mask for CODE-15% negatives
                     hard_neg = (code_neg & (p_pos > 0.8))   # bool mask for hard negatives among CODE-15% negatives (potential mislabels)
                     #print(hard_neg.sum().item(), 'hard negatives in batch') # only 0 or 1 hard negatives in each batch (ok as mislabels should be less than 4%)
                     scale = torch.ones_like(p_pos) # on device
-                    scale[hard_neg] = 0.01 # down-weight hard negatives by 0.2, or 0.1, or 0.05, or 0.01
+                    scale[hard_neg] = 0.05 # down-weight hard negatives by 0.2, or 0.1, or 0.05, or 0.01
 
-                # Final loss: weighted mean
-                loss = (per_sample_loss * scale).mean()"""
-                loss = per_sample_loss.mean()
+                # Down-weighted loss: weighted mean
+                loss = (per_sample_loss * scale).mean()
+                #loss = per_sample_loss.mean()
 
-                # Pairwise Ranking Loss
+                # Pairwise Ranking (Hinge) Loss
                 # using logits:
                 logits = outputs[:, 1] - outputs[:, 0]
                 # using probabilities:
                 #p = torch.softmax(outputs, dim=1)[:, 1]
                 pos = (y == 1)
-                neg = (y == 0) 
+                neg = (y == 0) # excluding hard negatives in CODE-15% data (& ~(hard_neg)) seems to hurt performance
 
                 if pos.any() and neg.any():
                     # using logits:
@@ -318,10 +322,10 @@ def train_model(data_folder, model_folder, verbose):
                     #margin = 0.05 # probability margin
                     rank_loss = (margin + top_neg.unsqueeze(0) - pos_scores).clamp_min(0).mean()
                     # ramp the weight so it matters after the EMA peak
-                    #w0, w1 = 0.2, 0.2  # start small, end modest 0.05, 0.3
-                    #t = epoch / max(EPOCHS-1, 1)
-                    #rank_w = w0 + (w1 - w0) * t
-                    rank_w = 0.2
+                    w0, w1 = 0.0, 0.1  # start small, end modest 0.0, 0.1
+                    t = epoch / max((EPOCHS-1)//2, 1) # ramp from 0.0 to 0.1 in (EPOCHS-1)//2 epochs then stay at 0.1
+                    rank_w = w0 + (w1 - w0) * t
+                    #rank_w = 0.1
                     #print(f"Rank Loss: {rank_loss.item():.4f}, Loss: {loss.item():.4f}")        
                     loss = loss + rank_w * rank_loss
 
@@ -377,9 +381,9 @@ def train_model(data_folder, model_folder, verbose):
 
             gc.collect()  # free memory after each epoch
 
-            """ if verbose:
+            if verbose:
                 print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"Fold {fold}, Epoch {epoch + 1}: "
+                print(f"Fold {fold}, Epoch {epoch}: "
                     f"Train Loss = {avg_train_loss:.3f}, "
                     f"Val Loss = {avg_val_loss:.3f}, "
                     f"F1_Best = {best_f1:.3f}, "
@@ -387,7 +391,7 @@ def train_model(data_folder, model_folder, verbose):
                     f"AUROC = {auroc:.3f}, "
                     f"AUPRC = {auprc:.3f}, "
                     f"Challenge Score = {challenge_score:.3f}, "
-                    f"LR = {optimizer.param_groups[0]['lr']:.2e}") """
+                    f"LR = {optimizer.param_groups[0]['lr']:.2e}")
                 
             #if avg_val_loss <= best_val_loss:
             #    best_val_loss = avg_val_loss
@@ -421,11 +425,12 @@ def run_model(record, model, verbose):
     output = model(x)
     probs = torch.softmax(output, dim=1).detach().numpy()[0]
     binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # 1 for Chagas disease, 0 for no Chagas diseas
-    return binary_output, probs[1] """
+    return binary_output, probs[1]"""
 
 # load 5 models from the model_folder
 def load_individual_model(path):
     model = ConvNeXtV2_1D_ECG()
+    # print(f"# trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}" )
     checkpoint = torch.load(path, map_location=torch.device('cpu'))
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     model.eval()
@@ -450,7 +455,7 @@ def run_model(record, model, verbose): # model is a list of 5 models
     x = extract_ECG(record, augment=False).unsqueeze(0)
     output_logits = ensemble_logits(x, model)
     probs = torch.softmax(output_logits, dim=1).detach().numpy()[0]
-    binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # 1 for Chagas disease, 0 for no Chagas diseas
+    binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # probs[1] are probabilites for Chagas disease, probs[0] for non-Chagas diseas
     return binary_output, probs[1]
 
 def extract_ECG(record, augment=False):
@@ -483,7 +488,7 @@ def extract_ECG(record, augment=False):
     else: # random cropping if augment = True
         signal = random_crop(signal, target_length=ECG_len) if augment else signal[:, :ECG_len] 
 
-	# [0.05, 150] seems to give better challenge score than [0.5, 47]
+	# [0.05, 150] seems to give slightly worse challenge score on hidden validation set than [0.5, 59] (0.292 vs 0.293)
     signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.5, 59], augment=augment, target_length=ECG_len)  
     #assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
 
@@ -495,7 +500,7 @@ def remove_baseline_wavelet_filter(ecg_12lead, wavelet='sym8', level=8): # or 8
     """
     Baseline removal for 12-lead ECG with shape (12, length)
     ecg_12lead: 12 lead ECG (12, length)
-    wavelet:  Wavelet type (e.g., 'sym8' or Daubechies 6 'db6' is commonly used for ECG)
+    wavelet:  Wavelet type (e.g., Symlet-8 'sym8' or Daubechies 6 'db6' is commonly used for ECG)
     level:  Decomposition level (higher = slower baseline removed, level 8 for 400hz sampling rate removes frequencies slower than ~0.78 Hz)
     level 9 (0.039hz) is too high for 4096 length
     Returns: cleaned ECG, same shape (12, length)
@@ -637,7 +642,7 @@ def ECG_preprocess(signal, sample_rate=400, powerline_freqs=[60, 50], bandwidth=
         if np.random.rand() < 0.2:
             x = random_lead_dropout(x)
         # 6. Optional: add baseline wander
-        # if np.random.rand() < 0.2:
+        #if np.random.rand() < 0.2:
         #     x = add_baseline_wander(x, sample_rate)
     return x
 
@@ -682,18 +687,20 @@ def drop_path(x, drop_prob=0.0, training=False):
 
 # 1D ConvNeXt V2 basic block
 class ConvNeXtV2Block1D(nn.Module):
-    def __init__(self, dim, drop_prob=0.0):
+    def __init__(self, dim, drop_prob=0.0, layer_scale_init_value=1e-6):
         super().__init__()
-        self.dwconv = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)  # padding=(kernel_size-1)//2, depthwise conv, no need to use large kernel_size
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)  # tried larger kernel 7 or 15 (worse) padding=(kernel_size-1)//2, depthwise conv, 
         #self.norm = nn.LayerNorm(dim, eps=1e-6)
         #self.norm = Norm1d(dim)
         self.norm = nn.BatchNorm1d(dim)
-        # self.pwconv1 = nn.Linear(dim, 4 * dim) # inverted bottleneck: 1x1 conv
-        self.pwconv1 = nn.Conv1d(dim, 4 * dim, kernel_size=1)
+        # self.pwconv1 = nn.Linear(dim, 4 * dim) 
+        self.pwconv1 = nn.Conv1d(dim, 4 * dim, kernel_size=1) # inverted bottleneck: 1x1 conv
         self.act = nn.GELU()
         #self.grn = GRN(4 * dim)
         #self.pwconv2 = nn.Linear(4 * dim, dim)
         self.pwconv2 = nn.Conv1d(4 * dim, dim, kernel_size=1)
+        #self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
+        #                            requires_grad=True) if layer_scale_init_value > 0 else None
         self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
 
     def forward(self, x):
@@ -701,10 +708,13 @@ class ConvNeXtV2Block1D(nn.Module):
         x = self.dwconv(x)
         #x = x.transpose(1,2)  # (B, C, L) -> (B, L, C)
         x = self.norm(x)
-        x = self.pwconv1(x)
+        x = self.pwconv1(x) 
+
         x = self.act(x)
         #x = self.grn(x)
         x = self.pwconv2(x)
+        #if self.gamma is not None:
+        #    x = self.gamma * x
         #x = x.transpose(1,2)  # (B, L, C) -> (B, C, L)
         x = shortcut + self.drop_path(x)
         return x
@@ -727,7 +737,7 @@ class Downsample1D(nn.Module):
 
 # stem for ConvNeXt V2
 class Stem1D(nn.Module):
-    def __init__(self, input_channels, out_channels, kernel_size=3):
+    def __init__(self, input_channels, out_channels, kernel_size=3): # tried 4, 7 or 15 (worse)
         super().__init__()
         self.conv = nn.Conv1d(input_channels, out_channels, kernel_size=kernel_size, stride=kernel_size)
         #self.norm = nn.LayerNorm(out_channels, eps=1e-6)
@@ -741,15 +751,15 @@ class Stem1D(nn.Module):
         #x = x.transpose(1, 2)        # [B, C, L]
         return x
 
-# 1D ConvNeXtV2 model: ~23 million parameters for [64, 128, 256, 512], [3, 3, 9, 3]; ~ 2.37 million parameters for [32, 64, 128, 256]
+# 1D ConvNeXtV2 model: ~16.9 million parameters for [64, 128, 256, 512], [3, 3, 18, 3], stem kernel_size=3, Block kernel_size=3
 class ConvNeXtV2_1D_ECG(nn.Module):
     def __init__(self, input_channels=12, num_classes=2):
         super().__init__()
-        dims = [96, 192, 384, 768]  # Small dimensions [64, 128, 256, 512], [96, 192, 384, 768] try larger dims like [128, 256, 512, 1024] if data and compute allow
-        stages = [3, 3, 27, 3]      # Small block counts [2, 2, 6, 2], try larger stages like [3, 3, 27, 3] if data and compute allow
+        dims = [64, 128, 256, 512]  # Small dimensions [64, 128, 256, 512], [96, 192, 384, 768] try larger dims like [128, 256, 512, 1024] if data and compute allow
+        stages = [3, 3, 18, 3]      # Small block counts [2, 2, 6, 2], try larger stages like [3, 3, 27, 3] if data and compute allow
         drop_path_rate = 0.1
 
-        self.stem = Stem1D(input_channels, dims[0], kernel_size=3)
+        self.stem = Stem1D(input_channels, dims[0], kernel_size=3) # tried 4, 7 or 15 (worse)
 
         self.blocks = nn.ModuleList()
         dp_rates = [drop_path_rate * (i / (sum(stages) - 1)) for i in range(sum(stages))]
@@ -758,7 +768,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         for i, num_blocks in enumerate(stages):
             stage = []
             for j in range(num_blocks):
-                stage.append(ConvNeXtV2Block1D(dims[i], drop_prob=dp_rates[cur]))
+                stage.append(ConvNeXtV2Block1D(dims[i], drop_prob=dp_rates[cur], layer_scale_init_value=1e-6))
                 cur += 1
             self.blocks.append(nn.Sequential(*stage))
 
@@ -771,7 +781,7 @@ class ConvNeXtV2_1D_ECG(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
 
         self.dropout = nn.Dropout(0.3)
-        self.head = nn.Sequential(
+        self.head = nn.Sequential( # head for classification: output logits for 2 classes
             nn.Linear(dims[-1], 512),
             nn.GELU(),
             nn.Dropout(0.3),
