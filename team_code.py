@@ -173,9 +173,9 @@ def train_model(data_folder, model_folder, verbose):
     # Find the records SaMi:CODE15%:PTB-XL:Total:
     # 1631:28569:21000:51200; 
     # 1000:31200:19000:51200; 
-    MAX_SAMI = 1631 # all positives
-    MAX_CODE15 = 28569 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
-    MAX_PTBXL = 21000 # all negatives from Germany not from the endemic region South America
+    MAX_SAMI = 1000 # all positives
+    MAX_CODE15 = 31200 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
+    MAX_PTBXL = 19000 # all negatives from Germany not from the endemic region South America
     MAX_TOTAL = 51200 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
 
     all_records = find_records(data_folder)
@@ -222,7 +222,7 @@ def train_model(data_folder, model_folder, verbose):
     labels = np.array(labels)
     label_smoothing_flags = np.array(label_smoothing_flags)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42) # 12345, 8011
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42) # 42, 12345, 8011
     #best_val_loss_overall = float('inf')
     best_challenge_score_overall = -1.0
     best_model_state_overall = None
@@ -247,10 +247,27 @@ def train_model(data_folder, model_folder, verbose):
         val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=8, pin_memory=True, drop_last=True)
 
         model = ConvNeXtV2_1D_ECG().to(device)
-        # print(f"# of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}" )
+        # print(f"# trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}" ) # ~16.9M parameters
         ema = ModelEMA(model, decay=0.999, device=device)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
+        # ---- param groups: decay vs no_decay ----
+        decay, no_decay = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.endswith('bias') or n.endswith('gamma') or p.ndim == 1:
+                # 1D params = norms’ scale, biases, LayerScale gamma → no weight decay
+                no_decay.append(p)
+            else:
+                decay.append(p)
+
+        optimizer = torch.optim.AdamW(
+            [{'params': decay,    'weight_decay': 1e-3},
+            {'params': no_decay, 'weight_decay': 0.0}],
+            lr=2e-4
+        )
+        #optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
+        
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=5e-6)
 
@@ -307,7 +324,7 @@ def train_model(data_folder, model_folder, verbose):
                 neg = (y == 0) # excluding hard negatives in CODE-15% data (& ~(hard_neg)) seems to hurt performance
 
                 if pos.any() and neg.any():
-                    # using logits:
+                    # using logits: better than probabilities
                     pos_scores = logits[pos].unsqueeze(1)
                     neg_scores = logits[neg]
                     # using probabilities:
@@ -322,10 +339,10 @@ def train_model(data_folder, model_folder, verbose):
                     #margin = 0.05 # probability margin
                     rank_loss = (margin + top_neg.unsqueeze(0) - pos_scores).clamp_min(0).mean()
                     # ramp the weight so it matters after the EMA peak
-                    w0, w1 = 0.0, 0.1  # start small, end modest 0.0, 0.1
-                    t = epoch / max((EPOCHS-1)//2, 1) # ramp from 0.0 to 0.1 in (EPOCHS-1)//2 epochs then stay at 0.1
-                    rank_w = w0 + (w1 - w0) * t
-                    #rank_w = 0.1
+                    #w0, w1 = 0.0, 0.1  # start small, end modest 0.0, 0.1
+                    #t = epoch / max((EPOCHS-1)//2, 1) # ramp from 0.0 to 0.1 in (EPOCHS-1)//2 epochs then stay at 0.1
+                    #rank_w = w0 + (w1 - w0) * t
+                    rank_w = 0.1 # tried 0.05, 0.1, 0.2, 0.1 is best
                     #print(f"Rank Loss: {rank_loss.item():.4f}, Loss: {loss.item():.4f}")        
                     loss = loss + rank_w * rank_loss
 
@@ -441,6 +458,43 @@ def ensemble_logits(x, models):
     # average logits is better than averaging probs
     return sum(m(x) for m in models) / len(models)
 
+@torch.no_grad()
+def ensemble_logits_top_n(x, models, top_n=3, prob_class=1):
+    """
+    x:        [B, ...] input batch
+    models:   list of nn.Module, each returns logits [B, C] (e.g., C=12)
+    top_n:    int or None. If None or >= len(models), average all models.
+              Else, per sample, pick the top_n models by probability score.
+    prob_class: int or None. If None, use each model's max class prob as the
+                score; else use the prob of this class index (e.g., 1 for "Chagas positive").
+    Returns:
+        avg_logits: [B, C] averaged logits of the selected models (per sample).
+    """
+    M = len(models)
+    # Stack logits: [M, B, C]
+    L = torch.stack([m(x) for m in models], dim=0)
+
+    if (top_n is None) or (top_n >= M):
+        return L.mean(dim=0)
+
+    # Convert to probabilities for scoring: [M, B, C]
+    P = torch.softmax(L, dim=-1)
+
+    # Scores to rank models per sample: [M, B]
+    if prob_class is None:
+        scores = P.max(dim=-1).values
+    else:
+        scores = P[..., prob_class]
+
+    # For each sample (B), pick indices of top_n models: [B, top_n]
+    top_idx = scores.transpose(0, 1).topk(k=top_n, dim=1).indices
+
+    # Gather the selected models' logits per sample and average
+    # Reorder to [B, M, C] to gather along dim=1
+    L_bmc = L.permute(1, 0, 2)
+    logits_top_n = L_bmc.gather(dim=1, index=top_idx.unsqueeze(-1).expand(-1, top_n, L_bmc.size(-1)))
+    return logits_top_n.mean(dim=1)
+
 def load_model(model_folder, verbose):
     model_paths = [os.path.join(model_folder, f"model_{i}.pt") for i in range(1, 6)]
     ckpts = [p for p in model_paths if os.path.isfile(p)]
@@ -454,6 +508,7 @@ def load_model(model_folder, verbose):
 def run_model(record, model, verbose): # model is a list of 5 models
     x = extract_ECG(record, augment=False).unsqueeze(0)
     output_logits = ensemble_logits(x, model)
+    #output_logits = ensemble_logits_top_n(x, model, top_n=3, prob_class=1) # average top 3 models per sample by logits for class 1 (Chagas positive)
     probs = torch.softmax(output_logits, dim=1).detach().numpy()[0]
     binary_output = int(probs[1] > THRESHOLD_PROBABILITY)  # probs[1] are probabilites for Chagas disease, probs[0] for non-Chagas diseas
     return binary_output, probs[1]
@@ -699,8 +754,8 @@ class ConvNeXtV2Block1D(nn.Module):
         #self.grn = GRN(4 * dim)
         #self.pwconv2 = nn.Linear(4 * dim, dim)
         self.pwconv2 = nn.Conv1d(4 * dim, dim, kernel_size=1)
-        #self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
-        #                            requires_grad=True) if layer_scale_init_value > 0 else None
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(1, dim, 1), 
+                                    requires_grad=True) if layer_scale_init_value > 0 else None
         self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
 
     def forward(self, x):
@@ -713,8 +768,8 @@ class ConvNeXtV2Block1D(nn.Module):
         x = self.act(x)
         #x = self.grn(x)
         x = self.pwconv2(x)
-        #if self.gamma is not None:
-        #    x = self.gamma * x
+        if self.gamma is not None:
+            x = self.gamma * x
         #x = x.transpose(1,2)  # (B, L, C) -> (B, C, L)
         x = shortcut + self.drop_path(x)
         return x
