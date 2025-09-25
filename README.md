@@ -1,13 +1,14 @@
 # Team ECG_ChD_25
 George B. Moody PhysioNet Challenge 2025
 
-For training, our code uses data from all three sources: Sami-Trop, PTB-XL and 'CODE-15%'. 
+For training, our code uses ECG data from three public sources: Sami-Trop, PTB-XL and 'CODE-15%'. 
 
-Our algorithm is based on a one-dimensional (1D) EfficientNet B3 or ConvNeXt V2 deep neural networks (DNN). We trained the 1D DNN model with labeled 12 lead ECG data: 1000 from Sami-Trop, 14000 from CODE-15% and 10920 for PTB-XL. Class weights [1, 19.0] are applied to negative and positve cases to address class imbalance. Label smoothing (0.1) is applied only to the weakly labeled CODE-15% data. A custom loss function combining a Generalized Cross-entropy loss (q=0.7) (or Focal loss, gamma = 1.0) and a Softmax approximated differentiable TPR@5% loss, AdamW optimizer over 10 epochs, initial learning rate of 2e-4, dropout rate of 0.3, and weight_decay of 1e-2 were used. Dynamic learning rate reduction on plateau was used to enable more effective training convergence. A 5-fold cross validation was employed and the final model was chosen as the best performing model from each fold.
+Our algorithm is based on a one-dimensional (1D) ConvNeXt deep neural networks (DNN) [1]. We trained the 1D ConvNeXt model with labeled 12 lead ECG data: 1631 from Sami-Trop, 21000 from CODE-15% and 28569 for PTB-XL. Class weights [1, 9.0] are applied to negative and positve cases to address class imbalance. Label smoothing (0.02) is applied only to the weakly labeled CODE-15% data. We also oversampled minority class to 50% per epoch. A custom loss function combining Focal loss with a pair-wise ranking (hinge) loss, AdamW optimizer over 12 epochs, initial learning rate of 2e-4, dropout rate of 0.3, and weight_decay of 1e-3 were used. Cosine annealing LR scheduler (T_max = 12 epochs, minimum LR = 5e-6) was used to enable more effective training convergence. A 5-fold cross validation was employed and the final model was chosen as a logit-averaged ensemble of the best-performing checkpoint from each fold.
 
 In the future, we will develop two additional DNN models: InceptionTime (multi-scale convolutional neural network) and TimesNet (attention-based) adapted for binary time series classification. We will compare the three models' performances. 
 
 We will also explore the use of gradient-weighted class activation mapping (Grad-CAM++) and XRAI to locate potentially human-interpretable 12-lead ECG features thus far unidentified for chronic Chagas cardiomyopathy.
 
-If time permits, we will also explore converting 12 lead ECG data to 2D ECG images and fine-tune some pretrained Pytorch Vision models such as ViT or RegNet. 
+If time permits, we will also explore converting 12 lead ECG data to 2D ECG images and fine-tune some pretrained large Vision models such as ViT, Swin Transformer or RegNet. 
 
+[1] Z. Liu, et al., “A ConvNet for the 2020s,” Mar. 02, 2022, arXiv: arXiv:2201.03545. doi: 10.48550/arXiv.2201.03545
