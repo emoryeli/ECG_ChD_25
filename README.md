@@ -1,5 +1,6 @@
 # Team ECG_ChD_25
 George B. Moody PhysioNet Challenge 2025
+https://moody-challenge.physionet.org/2025/
 
 For training, our code uses ECG data from three public sources: Sami-Trop, PTB-XL and 'CODE-15%'. 
 
