@@ -173,9 +173,9 @@ def train_model(data_folder, model_folder, verbose):
     # Find the records SaMi:CODE15%:PTB-XL:Total:
     # 1631:28569:21000:51200; 
     # 1000:31200:19000:51200; 
-    MAX_SAMI = 1000 # all positives
-    MAX_CODE15 = 31200 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
-    MAX_PTBXL = 19000 # all negatives from Germany not from the endemic region South America
+    MAX_SAMI = 1631 # all positives
+    MAX_CODE15 = 28569 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
+    MAX_PTBXL = 21000 # all negatives from Germany not from the endemic region South America
     MAX_TOTAL = 51200 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
 
     all_records = find_records(data_folder)
@@ -250,23 +250,7 @@ def train_model(data_folder, model_folder, verbose):
         # print(f"# trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}" ) # ~16.9M parameters
         ema = ModelEMA(model, decay=0.999, device=device)
 
-        # ---- param groups: decay vs no_decay ----
-        decay, no_decay = [], []
-        for n, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if n.endswith('bias') or n.endswith('gamma') or p.ndim == 1:
-                # 1D params = norms’ scale, biases, LayerScale gamma → no weight decay
-                no_decay.append(p)
-            else:
-                decay.append(p)
-
-        optimizer = torch.optim.AdamW(
-            [{'params': decay,    'weight_decay': 1e-3},
-            {'params': no_decay, 'weight_decay': 0.0}],
-            lr=2e-4
-        )
-        #optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-3)
         
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=5e-6)
@@ -303,7 +287,7 @@ def train_model(data_folder, model_folder, verbose):
 
                 # Down-weight hard negatives: non-chagas(label 0) with high predicted probability for Chagas (p > 0.8) (potential mislabels)
                 # future: try Huber loss?
-                with torch.no_grad():
+                """with torch.no_grad():
                     p_pos = torch.softmax(outputs, dim=1)[:, 1]     # [B]
                     code_neg = (y == 0) & smooth_flag # bool mask for CODE-15% negatives
                     hard_neg = (code_neg & (p_pos > 0.8))   # bool mask for hard negatives among CODE-15% negatives (potential mislabels)
@@ -312,8 +296,8 @@ def train_model(data_folder, model_folder, verbose):
                     scale[hard_neg] = 0.05 # down-weight hard negatives by 0.2, or 0.1, or 0.05, or 0.01
 
                 # Down-weighted loss: weighted mean
-                loss = (per_sample_loss * scale).mean()
-                #loss = per_sample_loss.mean()
+                loss = (per_sample_loss * scale).mean() """
+                loss = per_sample_loss.mean()
 
                 # Pairwise Ranking (Hinge) Loss
                 # using logits:
@@ -339,10 +323,10 @@ def train_model(data_folder, model_folder, verbose):
                     #margin = 0.05 # probability margin
                     rank_loss = (margin + top_neg.unsqueeze(0) - pos_scores).clamp_min(0).mean()
                     # ramp the weight so it matters after the EMA peak
-                    #w0, w1 = 0.0, 0.1  # start small, end modest 0.0, 0.1
-                    #t = epoch / max((EPOCHS-1)//2, 1) # ramp from 0.0 to 0.1 in (EPOCHS-1)//2 epochs then stay at 0.1
-                    #rank_w = w0 + (w1 - w0) * t
-                    rank_w = 0.1 # tried 0.05, 0.1, 0.2, 0.1 is best
+                    w0, w1 = 0.0, 0.1  # start small, end modest 0.0, 0.1
+                    t = epoch / max((EPOCHS-1)//2, 1) # ramp from 0.0 to 0.1 in (EPOCHS-1)//2 epochs then stay at 0.1
+                    rank_w = w0 + (w1 - w0) * t
+                    #rank_w = 0.1 # tried 0.05, 0.1, 0.2, 0.1 is best
                     #print(f"Rank Loss: {rank_loss.item():.4f}, Loss: {loss.item():.4f}")        
                     loss = loss + rank_w * rank_loss
 
@@ -362,7 +346,7 @@ def train_model(data_folder, model_folder, verbose):
             model.eval()
             ema.ema.eval()
 
-            val_loss = 0
+            #val_loss = 0
             val_outputs = [] #predicted probabilities, float64
             val_targets = [] #labels, 0 or 1
             
@@ -373,7 +357,7 @@ def train_model(data_folder, model_folder, verbose):
                     #outputs = model(X.to(device))
                     #outputs = torch.clamp(outputs, min=-20, max=20)
                     
-                    loss = custom_focal_loss(
+                    """loss = custom_focal_loss(
                         outputs,         # logits from model, shape (batch, 2)
                         y.to(device),         # int64 tensor, shape (batch,)
                         smooth_flag.to(device), # bool tensor, shape (batch,)
@@ -381,11 +365,11 @@ def train_model(data_folder, model_folder, verbose):
                         smoothing=0.02,  # label smoothing only for weakly labeled CODE-15% data, if too many FP's, decrease smoothing
                         gamma=2.0, # focusing parameter for focal loss
                     )
-                    val_loss += loss.item() * X.size(0)
+                    val_loss += loss.item() * X.size(0)"""
                     probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # probs for class 1: Chagas
                     val_outputs.extend(probs.tolist())
                     val_targets.extend(y.cpu().numpy().tolist())
-            avg_val_loss = val_loss / len(val_loader.dataset)
+            #avg_val_loss = val_loss / len(val_loader.dataset)
 
             #scheduler.step(avg_val_loss)
             scheduler.step()  # cosine step once per epoch
@@ -402,7 +386,7 @@ def train_model(data_folder, model_folder, verbose):
                 print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"Fold {fold}, Epoch {epoch}: "
                     f"Train Loss = {avg_train_loss:.3f}, "
-                    f"Val Loss = {avg_val_loss:.3f}, "
+                    #f"Val Loss = {avg_val_loss:.3f}, "
                     f"F1_Best = {best_f1:.3f}, "
                     f"Thres_Best = {best_threshold:.3f}, "
                     f"AUROC = {auroc:.3f}, "
@@ -544,7 +528,7 @@ def extract_ECG(record, augment=False):
         signal = random_crop(signal, target_length=ECG_len) if augment else signal[:, :ECG_len] 
 
 	# [0.05, 150] seems to give slightly worse challenge score on hidden validation set than [0.5, 59] (0.292 vs 0.293)
-    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[0.5, 59], augment=augment, target_length=ECG_len)  
+    signal = ECG_preprocess(signal, sample_rate=target_fs, powerline_freqs=[60, 50], bandwidth=[1, 47], augment=augment, target_length=ECG_len)  
     #assert not np.isnan(signal).any(), "NaN found after ECG_preprocess"
 
     return torch.tensor(signal.copy(), dtype=torch.float32)
@@ -754,8 +738,8 @@ class ConvNeXtV2Block1D(nn.Module):
         #self.grn = GRN(4 * dim)
         #self.pwconv2 = nn.Linear(4 * dim, dim)
         self.pwconv2 = nn.Conv1d(4 * dim, dim, kernel_size=1)
-        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(1, dim, 1), 
-                                    requires_grad=True) if layer_scale_init_value > 0 else None
+        #self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(1, dim, 1), 
+        #                            requires_grad=True) if layer_scale_init_value > 0 else None
         self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
 
     def forward(self, x):
@@ -768,8 +752,8 @@ class ConvNeXtV2Block1D(nn.Module):
         x = self.act(x)
         #x = self.grn(x)
         x = self.pwconv2(x)
-        if self.gamma is not None:
-            x = self.gamma * x
+        #if self.gamma is not None:
+        #    x = self.gamma * x
         #x = x.transpose(1,2)  # (B, L, C) -> (B, C, L)
         x = shortcut + self.drop_path(x)
         return x
