@@ -176,7 +176,7 @@ def train_model(data_folder, model_folder, verbose):
     MAX_SAMI = 1631 # all positives
     MAX_CODE15 = 28569 # ~1.91% positives but weakly labeled (patient self-reported, not confirmed by a serological test)
     MAX_PTBXL = 21000 # all negatives from Germany not from the endemic region South America
-    MAX_TOTAL = 51200 # mutiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set, hopefully this can finish training in 72 hours on 16vCPUs on aws
+    MAX_TOTAL = 51200 # integer multiples of batch_size to avoid last batch size mismatch; this should give Chagas prevalence <= 5% in the training set
 
     all_records = find_records(data_folder)
     records = []
@@ -202,7 +202,7 @@ def train_model(data_folder, model_folder, verbose):
                 label_smoothing_flags.append(False)
                 ptbxl_count += 1
             # else: skip, as we've already added maximum PTB-XL records
-        elif source == CODE15 and label == 0 and code15_count < MAX_CODE15:
+        elif source == CODE15 and label == 0 and code15_count < MAX_CODE15: # only include Chagas negatives from CODE15
                 records.append(record)
                 label_smoothing_flags.append(True) # label smoothing only on CODE-15% data
                 code15_count += 1
@@ -227,7 +227,7 @@ def train_model(data_folder, model_folder, verbose):
     best_challenge_score_overall = -1.0
     best_model_state_overall = None
 
-    os.makedirs(model_folder, exist_ok=True) # save the best model for each fold as model_{fold}.pt, and the best model overall as model.pt
+    os.makedirs(model_folder, exist_ok=True) # save the best checkpoint for each fold as model_{fold}.pt, and the best model overall as model.pt
     
     for fold, (train_idx, val_idx) in enumerate(skf.split(data_paths, labels), 1):
         if verbose:
@@ -255,7 +255,7 @@ def train_model(data_folder, model_folder, verbose):
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=5e-6)
 
-        weight = torch.tensor([1.0, 9.0]) # (1-POSITIVE_RATIO)/POSITIVE_RATIO
+        weight = torch.tensor([1.0, 9.0]) 
 
         #best_val_loss = float('inf')
         best_challenge_score = -1.0
