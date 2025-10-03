@@ -255,7 +255,7 @@ def train_model(data_folder, model_folder, verbose):
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=5e-6)
 
-        weight = torch.tensor([1.0, 9.0]) 
+        weight = torch.tensor([1.0, 8.0]) # tried 8.0, 9.0, 12.0, 19.0: 8.0 is best
 
         #best_val_loss = float('inf')
         best_challenge_score = -1.0
